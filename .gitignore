@@ -1,0 +1,98 @@
+#######################################
+# SISTEMA / EDITORES
+#######################################
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*.log
+
+#######################################
+# PYTHON
+#######################################
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+.eggs/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Virtualenvs
+.venv/
+venv/
+env/
+
+#######################################
+# FASTAPI / BACKEND
+#######################################
+# Environment
+.env
+.env.*
+!.env.example
+
+# Media / uploads (YT + presentation)
+media/
+uploads/
+
+# Temporary runtime files
+*.pid
+
+#######################################
+# AUDIO / VIDEO / PROCESSAMENTO
+#######################################
+*.mp3
+*.wav
+*.ogg
+*.aac
+*.flac
+*.mp4
+*.mkv
+*.webm
+
+#######################################
+# REDIS / MONGO (LOCAL)
+#######################################
+dump.rdb
+*.bson
+mongo-data/
+redis-data/
+
+#######################################
+# NODE / NEXT.JS (FRONTEND)
+#######################################
+node_modules/
+.next/
+out/
+dist/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+#######################################
+# NEXT.JS ENV
+#######################################
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+#######################################
+# TURBOPACK / CACHE
+#######################################
+.turbo/
+.cache/
+
+#######################################
+# DOCKER
+#######################################
+docker-data/
+*.tar
