@@ -1,0 +1,62 @@
+version: "3.9"
+
+services:
+  frontend:
+    build:
+      context: ./control-panel
+    container_name: playlist-frontend
+    ports:
+      - "3000:3000"
+    environment:
+      NEXT_PUBLIC_API_URL: http://backend:8000
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: ./backend
+    container_name: playlist-backend
+    ports:
+      - "8000:8000"
+    depends_on:
+      - mongo
+      - redis
+    environment:
+      APP_ENV: production
+
+      # Mongo
+      MONGO_URI: mongodb://mongo:27017/showdb
+
+      # Redis
+      REDIS_URL: redis://redis:6379/0
+
+      # Audio
+      AUDIO_DIR: /data/audio
+    volumes:
+      - audio_data:/data/audio
+    restart: unless-stopped
+
+  mongo:
+    image: mongo:7
+    container_name: playlist-mongo
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: playlist-redis
+    ports:
+      - "6379:6379"
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+
+volumes:
+  mongo_data:
+  redis_data:
+  audio_data:
