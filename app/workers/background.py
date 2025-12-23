@@ -1,16 +1,25 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+from typing import Awaitable
+
 from fastapi import BackgroundTasks
-from typing import Coroutine, Any
+
+log = logging.getLogger("workers.background")
 
 
-def run_coro(background: BackgroundTasks, coro: Coroutine[Any, Any, Any]) -> None:
+def run_coro(background: BackgroundTasks, coro: Awaitable[object]) -> None:
     """
-    FastAPI BackgroundTasks expects a sync callable.
-    We schedule the async coro on the running event loop.
+    Agenda um coroutine para rodar via FastAPI BackgroundTasks.
+    BackgroundTasks executa em threadpool (sem event loop).
+    Então a forma segura é executar o coro com asyncio.run dentro da task.
     """
-    def _kick() -> None:
-        asyncio.create_task(coro)
 
-    background.add_task(_kick)
+    def _kick(c: Awaitable[object]) -> None:
+        try:
+            asyncio.run(c)
+        except Exception:
+            log.exception("background_coro_failed")
+
+    background.add_task(_kick, coro)

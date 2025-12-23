@@ -1,175 +1,214 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 import time
-from typing import Optional, List, Dict, Any, Set
+import logging
+from typing import Optional
 
-from app.models.player import PlayerStatus
-from app.models.playlist import PlaylistStep
 from app.state.redis_state import RedisState
-from app.state.redis_keys import EVENTS_CHANNEL
-from app.state.playlist_state import get_playlist
-from app.state.player_state import get_player_status, save_player_status
-from app.core.config import settings
-from app.services.esp_client import send_cmd
+from app.state.redis_keys import PLAYER_STATUS_KEY, PLAYLIST_STEPS_KEY, EVENTS_CHANNEL
+from app.models.playlist import PlaylistStep
+from app.services.esp_udp import EspUdpClient
 
 log = logging.getLogger("player.executor")
 
 
-class PlaylistExecutor:
-    """
-    Single-instance player state machine.
+def clamp(v: int, lo: int, hi: int) -> int:
+    return max(lo, min(hi, v))
 
-    Supports:
-      - music: bpm-based beat loop
-      - presentation: scripted timeline execution
-    """
+
+class PlaylistExecutor:
+    TICK_HZ = 30
+
+    ESP_LEFT = "192.168.4.102"  # 4 fitas → 0..31
+    ESP_RIGHT = "192.168.4.101"  # 2 fitas → 0..50
 
     def __init__(self, state: RedisState):
         self.state = state
+        self.udp = EspUdpClient()
         self._task: Optional[asyncio.Task] = None
-        self._stop = asyncio.Event()
-
-        self._last_tick_mono: float = time.monotonic()
-        self._beat_accum_s: float = 0.0
-        self._status_push_accum_s: float = 0.0
-
-        # presentation runtime
-        self._executed_events: Set[int] = set()
-
-    async def start(self) -> None:
-        if self._task and not self._task.done():
+        self._running = False
+        self.is_paused: bool = False
+        self._active_index: Optional[int] = None
+        self._started_at = 0.0
+        self._last_ct_hue: Optional[int] = None
+        
+    async def _publish_status_safe(self):
+        """
+        Compat layer: em algumas versões do projeto, o método se chama diferente.
+        Aqui tentamos publicar o status sem quebrar.
+        """
+        # 1) método mais comum em executores
+        fn = getattr(self, "emit_status", None)
+        if callable(fn):
+            await fn()
             return
-        self._stop.clear()
-        self._last_tick_mono = time.monotonic()
-        self._beat_accum_s = 0.0
-        self._status_push_accum_s = 0.0
-        self._executed_events.clear()
-        self._task = asyncio.create_task(self._run(), name="playlist_executor")
+    
+        # 2) nomes alternativos possíveis
+        for name in ("publish_status", "_publish_status", "broadcast_status", "_broadcast_status"):
+            fn2 = getattr(self, name, None)
+            if callable(fn2):
+                await fn2()
+                return
+    
+        # 3) fallback: escreve direto no RedisState (se existir)
+        # Ajuste os campos conforme seu contrato PlayerStatus
+        if hasattr(self, "state") and self.state:
+            try:
+                await self.state.set_player_status(
+                    {
+                        "isPlaying": False,
+                        "activeIndex": self._active_index if self._active_index is not None else -1,
+                        "elapsedMs": int(max(0.0, (asyncio.get_event_loop().time() - self._started_at) * 1000)),
+                        "bpm": 0,
+                        "palette": "blue",
+                        "currentTitle": "",
+                        "currentType": "pause",
+                    }
+                )
+            except Exception:
+                # não derruba o executor por falha de publish
+                log.exception("publish_status_fallback_failed")
+
+    async def start(self):
+        if self._running:
+            return
+        self._running = True
+        self._task = asyncio.create_task(self._loop())
         log.info("executor_started")
 
-    async def stop(self) -> None:
-        self._stop.set()
+    async def stop(self):
+        self._running = False
         if self._task:
-            try:
-                await asyncio.wait_for(self._task, timeout=3)
-            except Exception:
-                self._task.cancel()
-        log.info("executor_stopped")
+            self._task.cancel()
 
-    async def _publish_status(self, status: PlayerStatus) -> None:
-        await self.state.publish_event(
-            EVENTS_CHANNEL,
-            {"type": "status", "data": status.model_dump()},
+    async def pause(self):
+        if not self._running:
+            return
+
+        self.is_paused = True
+        await self._publish_status_safe()
+
+    async def resume(self):
+        if not self._running:
+            return
+
+        if not self.is_paused:
+            return
+
+        self.is_paused = False
+        await self.emit_status()
+
+    async def play_index(self, index: int):
+        steps = await self._get_steps()
+        step = steps[index]
+
+        self._active_index = index
+        self._started_at = time.monotonic()
+
+        await self._send_ct(off=True)
+        await self._send_vu(0, 0)
+
+        await self._publish_status(
+            isPlaying=True,
+            activeIndex=index,
+            elapsedMs=0,
+            bpm=step.bpm,
+            palette=step.palette,
+            currentTitle=step.title,
+            currentType=step.type,
         )
 
-    async def _send_beat(self, step: PlaylistStep) -> None:
-        payload = {
-            "bpm": step.bpm,
-            "palette": step.palette,
-            "stepId": step.id,
-        }
-        for _, ip in settings.esp_registry.items():
-            await send_cmd(ip, "beat", payload)
+        log.info("step_started", extra={"stepId": step.id})
 
-    async def _execute_timeline(
-        self,
-        step: PlaylistStep,
-        elapsed_ms: int,
-    ) -> None:
-        """
-        Execute presentation timeline commands exactly once.
-        """
-        for idx, item in enumerate(step.esp or []):
+    async def stop_playback(self):
+        await self._send_vu(0, 0)
+        await self._send_ct(off=True)
+        self._active_index = None
+        await self._publish_status(isPlaying=False, elapsedMs=0)
+
+    async def _loop(self):
+        interval = 1 / self.TICK_HZ
+
+        while self._running:
             try:
-                at_ms = int(item.get("atMs", -1))
-                if at_ms < 0:
+                if self.is_paused:
+                    await asyncio.sleep(interval)
                     continue
 
-                if idx in self._executed_events:
-                    continue
-
-                if elapsed_ms >= at_ms:
-                    target = item.get("target")
-                    cmd_type = item.get("type")
-                    payload = item.get("payload", {})
-
-                    for esp_id, ip in settings.esp_registry.items():
-                        if target not in ("broadcast", esp_id):
-                            continue
-                        await send_cmd(ip, cmd_type, payload)
-
-                    self._executed_events.add(idx)
+                await self._tick()
             except Exception:
-                log.exception("timeline_event_error", extra={"stepId": step.id})
+                log.exception("executor_tick_error")
 
-    async def _step_duration_ms(self, step: PlaylistStep) -> int:
-        if step.durationMs and step.durationMs > 0:
-            return step.durationMs
-        if step.type == "pause":
-            return 3000
-        if step.type == "presentation":
-            return step.durationMs or 0
-        return 0
+        await asyncio.sleep(interval)
 
-    async def _run(self) -> None:
-        while not self._stop.is_set():
-            try:
-                now = time.monotonic()
-                dt = now - self._last_tick_mono
-                self._last_tick_mono = now
+    async def _tick(self) -> None:
+        try:
+            status = await self.state.get_json(PLAYER_STATUS_KEY)
+        except Exception:
+            return
 
-                status = await get_player_status(self.state)
-                steps = await get_playlist(self.state)
+        if not status or not status.get("isPlaying"):
+            return
 
-                if not steps:
-                    if status.isPlaying:
-                        status.isPlaying = False
-                        status.elapsedMs = 0
-                        await save_player_status(self.state, status)
-                        await self._publish_status(status)
-                    await asyncio.sleep(0.2)
-                    continue
+        idx = self._active_index
+        if idx is None:
+            return
 
-                if status.activeIndex >= len(steps):
-                    status.activeIndex = max(0, len(steps) - 1)
+        steps = await self._get_steps()
+        step = steps[idx]
 
-                current = steps[status.activeIndex]
+        elapsed = int((time.monotonic() - self._started_at) * 1000)
 
-                status.bpm = int(current.bpm or 120)
-                status.palette = current.palette
-                status.currentTitle = current.title
-                status.currentType = current.type
+        await self._publish_status(elapsedMs=elapsed)
 
-                if status.isPlaying and current.status == "ready":
-                    status.elapsedMs += int(dt * 1000)
+        # ===== VU =====
+        bpm = step.bpm or 120
+        beat_ms = 60000 / bpm
+        phase = (elapsed % beat_ms) / beat_ms
 
-                    if current.type == "music":
-                        bpm = max(30, min(240, status.bpm))
-                        beat_interval_s = 60.0 / float(bpm)
-                        self._beat_accum_s += dt
+        vu_left = clamp(int(phase * 31), 0, 31)
+        vu_right = clamp(int(phase * 50), 0, 50)
 
-                        while self._beat_accum_s >= beat_interval_s:
-                            self._beat_accum_s -= beat_interval_s
-                            await self._send_beat(current)
+        await self._send_vu(vu_left, vu_right)
 
-                    elif current.type == "presentation":
-                        await self._execute_timeline(current, status.elapsedMs)
+        # ===== CONTORNO =====
+        hue = self._palette_to_hue(step.palette)
+        if hue != self._last_ct_hue:
+            await self._send_ct(hue=hue)
+            self._last_ct_hue = hue
 
-                    duration_ms = await self._step_duration_ms(current)
-                    if duration_ms > 0 and status.elapsedMs >= duration_ms:
-                        status.isPlaying = False
-                        self._executed_events.clear()
+        if step.durationMs and elapsed >= step.durationMs:
+            await self.stop_playback()
 
-                self._status_push_accum_s += dt
-                if status.isPlaying or self._status_push_accum_s >= 0.2:
-                    self._status_push_accum_s = 0.0
-                    await save_player_status(self.state, status)
-                    await self._publish_status(status)
+    async def _send_vu(self, left: int, right: int):
+        await self.udp.send(self.ESP_LEFT, f"VU:{left}")
+        await self.udp.send(self.ESP_RIGHT, f"VU:{right}")
 
-                await asyncio.sleep(0.05)
+    async def _send_ct(self, *, hue: int | None = None, off: bool = False):
+        if off:
+            await self.udp.send(self.ESP_LEFT, "CT:OFF")
+            await self.udp.send(self.ESP_RIGHT, "CT:OFF")
+        elif hue is not None:
+            await self.udp.send(self.ESP_LEFT, f"CT:SOLID:{hue}")
+            await self.udp.send(self.ESP_RIGHT, f"CT:SOLID:{hue}")
 
-            except Exception:
-                log.exception("executor_loop_error")
-                await asyncio.sleep(0.2)
+    def _palette_to_hue(self, palette: str) -> int:
+        return {
+            "blue": 160,
+            "purple": 200,
+            "green": 96,
+            "orange": 24,
+        }.get(palette, 160)
+
+    async def _get_steps(self) -> list[PlaylistStep]:
+        raw = await self.state.get_json(PLAYLIST_STEPS_KEY) or []
+        return [PlaylistStep(**s) for s in raw]
+
+    async def _publish_status(self, **fields):
+        status = await self.state.get_json(PLAYER_STATUS_KEY) or {}
+        status.update(fields)
+        await self.state.set_json(PLAYER_STATUS_KEY, status)
+        await self.state.publish_event(
+            EVENTS_CHANNEL, {"type": "status", "data": status}
+        )

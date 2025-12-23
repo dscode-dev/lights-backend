@@ -1,213 +1,233 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
-import re
+import subprocess
 from dataclasses import dataclass
 from typing import Optional
 
 from app.core.config import settings
-from app.models.playlist import PlaylistStep, EspCommand
-from app.state.redis_state import RedisState
-from app.state.redis_keys import EVENTS_CHANNEL, processing_key
 from app.state.playlist_state import get_playlist, save_playlist
-from app.services.audio_analysis import analyze_audio
+from app.state.redis_keys import EVENTS_CHANNEL
+from app.state.redis_state import RedisState
+from app.services.audio_analyzer import AudioAnalyzer
+from app.services.openai_client import OpenAIClient
 
-log = logging.getLogger("pipeline.youtube")
-
-
-def _safe_filename(s: str) -> str:
-    s = s.strip()
-    s = re.sub(r"[^\w\s\-\.]", "", s, flags=re.UNICODE)
-    s = re.sub(r"\s+", "_", s)
-    return s[:120] if s else "track"
+log = logging.getLogger("youtube.pipeline")
 
 
-async def _run_cmd(*cmd: str) -> tuple[int, str, str]:
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    out_b, err_b = await proc.communicate()
-    out = (out_b or b"").decode("utf-8", errors="replace")
-    err = (err_b or b"").decode("utf-8", errors="replace")
-    return proc.returncode or 0, out, err
-
+# =========================
+# JOB MODEL
+# =========================
 
 @dataclass
 class AddFromYouTubeJob:
     step_id: str
+    title: str
+    genre: str
+    palette: str
     youtube_url: str
-    use_ai: bool
+    use_ai: bool = True
 
+
+# =========================
+# PIPELINE
+# =========================
 
 class YouTubePipeline:
-    def __init__(self, state: RedisState):
+    def __init__(self, state: RedisState) -> None:
         self.state = state
+        self.analyzer = AudioAnalyzer()
+        self.ai = OpenAIClient()
 
-    async def _publish_progress(self, step_id: str, progress: float) -> None:
-        if progress < 0:
-            progress = 0.0
-        if progress > 1:
-            progress = 1.0
+        self._queue: asyncio.Queue[AddFromYouTubeJob] = asyncio.Queue()
+        self._workers: list[asyncio.Task] = []
+        self._running = False
 
-        await self.state.set_json(processing_key(step_id), {"stepId": step_id, "progress": progress})
-        await self.state.publish_event(
-            EVENTS_CHANNEL,
-            {"type": "playlist_progress", "data": {"stepId": step_id, "progress": progress}},
+    # =========================
+    # LIFECYCLE
+    # =========================
+
+    async def start(self) -> None:
+        if self._running:
+            return
+
+        self._running = True
+        n = max(1, settings.pipeline_concurrency)
+
+        for i in range(n):
+            self._workers.append(asyncio.create_task(self._worker(i)))
+
+        log.info("pipeline_workers_started", extra={"workers": n})
+
+    async def stop(self) -> None:
+        self._running = False
+        for task in self._workers:
+            task.cancel()
+        self._workers.clear()
+        log.info("pipeline_workers_stopped")
+
+    # =========================
+    # PUBLIC API
+    # =========================
+
+    async def dispatch(self, job: AddFromYouTubeJob) -> None:
+        log.info("pipeline_dispatch_called", extra={"stepId": job.step_id})
+        await self._queue.put(job)
+        log.info("pipeline_dispatched", extra={"stepId": job.step_id})
+
+    # =========================
+    # WORKER
+    # =========================
+
+    async def _worker(self, idx: int) -> None:
+        log.info("pipeline_worker_up", extra={"worker": idx})
+
+        while self._running:
+            job = await self._queue.get()
+            try:
+                await asyncio.wait_for(
+                    self._run_job(job),
+                    timeout=settings.pipeline_job_timeout_s,
+                )
+            except Exception as e:
+                log.exception("pipeline_failed", extra={"stepId": job.step_id})
+                await self._fail(job.step_id, str(e))
+            finally:
+                self._queue.task_done()
+
+    # =========================
+    # JOB FLOW
+    # =========================
+
+    async def _run_job(self, job: AddFromYouTubeJob) -> None:
+        log.info("pipeline_started", extra={"stepId": job.step_id})
+
+        await self._progress(job.step_id, 0.1, "download_start")
+        audio_path = await self._download_audio(job.youtube_url, job.step_id)
+        await self._progress(job.step_id, 0.25, "download_done")
+
+        await self._progress(job.step_id, 0.35, "audio_load")
+        analysis = self.analyzer.analyze(audio_path)
+
+        duration_ms = int(analysis["durationMs"])
+        bpm = int(analysis["bpm"])
+        beat_map = list(analysis["beatMap"])
+
+        await self._progress(job.step_id, 0.6, "audio_done")
+
+        led_plan = None
+        if job.use_ai:
+            await self._progress(job.step_id, 0.7, "ai_start")
+            led_plan = await self.ai.led_plan(
+                title=job.title,
+                genre=job.genre,
+                palette=job.palette,
+                duration_ms=duration_ms,
+                bpm=bpm,
+                beat_map_preview=beat_map,
+                topology=self._led_topology(),
+            )
+            await self._progress(job.step_id, 0.9, "ai_done")
+
+        await self._mark_ready(
+            step_id=job.step_id,
+            duration_ms=duration_ms,
+            bpm=bpm,
+            beat_map=beat_map,
+            led_plan=led_plan,
         )
 
-    async def _publish_error(self, step_id: str, message: str) -> None:
-        await self.state.publish_event(
-            EVENTS_CHANNEL,
-            {"type": "playlist_error", "data": {"stepId": step_id, "error": message}},
+        await self._progress(job.step_id, 1.0, "ready")
+        log.info("pipeline_completed", extra={"stepId": job.step_id})
+
+    # =========================
+    # HELPERS
+    # =========================
+
+    async def _download_audio(self, youtube_url: str, step_id: str) -> str:
+        os.makedirs(settings.media_dir, exist_ok=True)
+        out_path = os.path.join(settings.media_dir, f"{step_id}.wav")
+
+        log.info("audio_download_start", extra={"stepId": step_id})
+
+        subprocess.run(
+            [
+                "yt-dlp",
+                "-x",
+                "--audio-format",
+                "wav",
+                "--no-playlist",
+                "--no-cache-dir",
+                "-o",
+                out_path.replace(".wav", ".%(ext)s"),
+                youtube_url,
+            ],
+            check=True,
         )
 
-    async def _publish_ready(self, step: PlaylistStep) -> None:
+        log.info("audio_download_done", extra={"stepId": step_id})
+        return out_path
+
+    async def _progress(self, step_id: str, progress: float, stage: str) -> None:
         await self.state.publish_event(
             EVENTS_CHANNEL,
-            {"type": "playlist_ready", "data": {"step": step.model_dump()}},
+            {
+                "type": "playlist_progress",
+                "data": {
+                    "stepId": step_id,
+                    "progress": progress,
+                    "stage": stage,
+                },
+            },
         )
 
-    async def _update_step(self, step_id: str, mutator) -> Optional[PlaylistStep]:
+    async def _fail(self, step_id: str, error: str) -> None:
         steps = await get_playlist(self.state)
-        changed: Optional[PlaylistStep] = None
         for i, s in enumerate(steps):
             if s.id == step_id:
-                s2 = mutator(s)
-                steps[i] = s2
-                changed = s2
-                break
-        await save_playlist(self.state, steps)
-        return changed
+                s.status = "error"
+                s.error = error
+                s.progress = 1.0
+                steps[i] = s
+                await save_playlist(self.state, steps)
+                await self.state.publish_event(
+                    EVENTS_CHANNEL,
+                    {"type": "playlist", "data": {"steps": [x.model_dump() for x in steps]}},
+                )
+                return
 
-    async def _fetch_metadata_title(self, url: str) -> str:
-        # yt-dlp -J url (JSON metadata)
-        code, out, err = await _run_cmd(settings.ytdlp_bin, "-J", url)
-        if code != 0:
-            raise RuntimeError(f"yt-dlp metadata failed: {err.strip() or out.strip()}")
-        data = json.loads(out)
-        title = data.get("title") or "YouTube Track"
-        return str(title)
-
-    async def _download_mp3(self, url: str, out_mp3_path: str) -> None:
-        """
-        Uses yt-dlp to extract audio and convert to mp3.
-        Requires ffmpeg installed on machine.
-        """
-        out_dir = os.path.dirname(out_mp3_path)
-        os.makedirs(out_dir, exist_ok=True)
-
-        # yt-dlp will create .mp3 based on -o template and --audio-format
-        # We'll provide template WITHOUT extension; yt-dlp will append .mp3
-        template_no_ext = os.path.splitext(out_mp3_path)[0]
-
-        cmd = (
-            settings.ytdlp_bin,
-            "-x",
-            "--audio-format",
-            "mp3",
-            "--audio-quality",
-            "0",
-            "-o",
-            template_no_ext + ".%(ext)s",
-            url,
-        )
-        code, out, err = await _run_cmd(*cmd)
-        if code != 0:
-            raise RuntimeError(f"yt-dlp download failed: {err.strip() or out.strip()}")
-
-        # yt-dlp will output something like template_no_ext.mp3
-        if not os.path.exists(out_mp3_path):
-            # sometimes ext handling can differ; try to locate any mp3 in dir with prefix
-            base = os.path.basename(template_no_ext)
-            candidates = [
-                os.path.join(out_dir, f)
-                for f in os.listdir(out_dir)
-                if f.startswith(base) and f.lower().endswith(".mp3")
-            ]
-            if candidates:
-                os.replace(candidates[0], out_mp3_path)
-            else:
-                raise RuntimeError("mp3 not found after yt-dlp download")
-
-    def _base_show_fields(self, step: PlaylistStep) -> PlaylistStep:
-        """
-        Fill base show values & initial ESP commands. (Simple baseline)
-        """
-        # baseline patterns (strings for now; you can evolve to structured later)
-        step.leds = "base_vu_pulse"
-        step.portal = "portal_soft"
-        step.hologram = "hologram_float"
-
-        step.esp = [
-            EspCommand(
-                target="broadcast",
-                type="set_palette",
-                payload={"palette": step.palette},
-            ),
-            EspCommand(
-                target="broadcast",
-                type="set_mode",
-                payload={"mode": "VU"},
-            ),
-        ]
-        return step
-
-    async def run(self, job: AddFromYouTubeJob) -> None:
-        step_id = job.step_id
-        url = job.youtube_url
-
-        try:
-            await self._publish_progress(step_id, 0.05)
-
-            title = await self._fetch_metadata_title(url)
-            await self._publish_progress(step_id, 0.15)
-
-            safe = _safe_filename(title)
-            out_mp3 = os.path.join(settings.media_dir, f"{step_id}_{safe}.mp3")
-
-            await self._download_mp3(url, out_mp3)
-            await self._publish_progress(step_id, 0.45)
-
-            duration_ms, bpm = analyze_audio(out_mp3)
-            await self._publish_progress(step_id, 0.75)
-
-            # Update step: fill computed fields
-            def apply_ready(s: PlaylistStep) -> PlaylistStep:
-                s.trackTitle = title
-                s.audioFile = out_mp3
+    async def _mark_ready(
+        self,
+        *,
+        step_id: str,
+        duration_ms: int,
+        bpm: int,
+        beat_map: list[int],
+        led_plan: Optional[dict],
+    ) -> None:
+        steps = await get_playlist(self.state)
+        for i, s in enumerate(steps):
+            if s.id == step_id:
+                s.status = "ready"
+                s.progress = 1.0
                 s.durationMs = duration_ms
                 s.bpm = bpm
-                s.progress = 1.0
-                s.status = "ready"
-                return self._base_show_fields(s)
+                s.beatMap = beat_map
+                s.ledPlan = led_plan
+                steps[i] = s
+                await save_playlist(self.state, steps)
+                await self.state.publish_event(
+                    EVENTS_CHANNEL,
+                    {"type": "playlist", "data": {"steps": [x.model_dump() for x in steps]}},
+                )
+                return
 
-            updated = await self._update_step(step_id, apply_ready)
-            if not updated:
-                raise RuntimeError("Step not found in playlist (was it deleted?)")
-
-            # Emit ready
-            await self._publish_progress(step_id, 1.0)
-            await self._publish_ready(updated)
-
-            log.info(
-                "youtube_pipeline_ready",
-                extra={"stepId": step_id, "bpm": bpm, "durationMs": duration_ms, "audioFile": out_mp3},
-            )
-
-        except Exception as e:
-            msg = str(e)
-            log.exception("youtube_pipeline_error", extra={"stepId": step_id})
-
-            # mark step as error
-            def apply_error(s: PlaylistStep) -> PlaylistStep:
-                s.status = "error"
-                s.progress = 0.0
-                return s
-
-            await self._update_step(step_id, apply_error)
-            await self._publish_error(step_id, msg)
+    def _led_topology(self) -> dict:
+        return {
+            "segments": {
+                "left": {"vu": {"strips": 4}},
+                "right": {"vu": {"strips": 2}},
+            }
+        }

@@ -1,12 +1,50 @@
-from __future__ import annotations
+# app/state/redis_keys.py
 
-# Core keys
+"""
+Contrato único de chaves Redis do sistema.
+
+⚠️ NUNCA usar strings hardcoded fora deste arquivo.
+"""
+
+# =========================
+# PLAYLIST
+# =========================
+
+# Lista ordenada de steps
+# type: List[PlaylistStep]
 PLAYLIST_STEPS_KEY = "playlist:steps"
+
+# =========================
+# PLAYER / EXECUTOR
+# =========================
+
+# Estado global do player
+# {
+#   isPlaying: bool
+#   activeIndex: int
+#   elapsedMs: int
+#   bpm: int
+#   palette: str
+#   currentTitle: str
+#   currentType: str
+# }
 PLAYER_STATUS_KEY = "player:status"
+
+# =========================
+# ESP / DEVICES
+# =========================
+
+# Lista de nós ESP conhecidos pelo backend
+# type: List[{
+#   id: str
+#   ip: str
+#   role: str
+# }]
 ESP_NODES_KEY = "esp:nodes"
 
-# PubSub channel
-EVENTS_CHANNEL = "events:pubsub"
+# =========================
+# EVENTS / WS
+# =========================
 
-def processing_key(step_id: str) -> str:
-    return f"processing:{step_id}"
+# Canal Pub/Sub único
+EVENTS_CHANNEL = "events:pubsub"

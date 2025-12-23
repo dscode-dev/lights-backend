@@ -5,26 +5,27 @@ import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
-from redis.asyncio import Redis
+from fastapi.middleware.cors import CORSMiddleware
 from pymongo import MongoClient
+from redis.asyncio import Redis
 
 from app.core.config import settings
 from app.core.logging import setup_logging
 
-from app.state.redis_state import RedisState
 from app.state.redis_keys import (
-    PLAYLIST_STEPS_KEY,
-    PLAYER_STATUS_KEY,
     ESP_NODES_KEY,
     EVENTS_CHANNEL,
+    PLAYER_STATUS_KEY,
+    PLAYLIST_STEPS_KEY,
 )
+from app.state.redis_state import RedisState
+
+from app.services.playlist_executor import PlaylistExecutor
+from app.services.youtube_pipeline import YouTubePipeline
 
 from app.ws.manager import WebSocketManager
 from app.ws.broadcaster import RedisToWebSocketBroadcaster
 
-from app.services.playlist_executor import PlaylistExecutor
-
-# Routers
 from app.api.routes_ws import router as ws_router
 from app.api.routes_playlist import router as playlist_router
 from app.api.routes_status import router as status_router
@@ -70,27 +71,47 @@ async def bootstrap_defaults(app: FastAPI) -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    setup_logging()
-    log.info("app_starting", extra={"env": settings.app_env})
+    # logging
+    setup_logging(settings.log_level)
+    log.info("app_starting")
 
+    # dirs
     os.makedirs(settings.media_dir, exist_ok=True)
 
+    # redis
     redis = Redis.from_url(settings.redis_url, decode_responses=False)
+    await redis.ping()
+    log.info("redis_connected")
+
     app.state.redis = redis
     app.state.state = RedisState(redis)
 
+    # mongo
     mongo_client = MongoClient(settings.mongo_url)
     app.state.mongo_client = mongo_client
     app.state.mongo_db = mongo_client[settings.mongo_db]
+    log.info("mongo_connected")
 
+    # ✅ PIPELINE (ERA ISSO QUE ESTAVA FALTANDO)
+    app.state.pipeline = YouTubePipeline(
+        app.state.state
+    )
+    await app.state.pipeline.start()
+    log.info("pipeline_initialized")
+
+    # websockets
     app.state.ws_manager = WebSocketManager()
     app.state.broadcaster = RedisToWebSocketBroadcaster(redis, app.state.ws_manager)
 
+    # defaults + broadcasters
     await bootstrap_defaults(app)
     await app.state.broadcaster.start()
+    log.info("ws_broadcaster_started")
 
+    # executor
     app.state.executor = PlaylistExecutor(app.state.state)
     await app.state.executor.start()
+    log.info("executor_started")
 
     try:
         yield
@@ -117,8 +138,19 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title=settings.app_name,
+    title=getattr(settings, "app_name", "Lights Backend"),
     lifespan=lifespan,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 app.include_router(ws_router)
@@ -132,6 +164,6 @@ app.include_router(player_router)
 def health():
     return {
         "ok": True,
-        "app": settings.app_name,
-        "env": settings.app_env,
+        "app": getattr(settings, "app_name", "Lights Backend"),
+        "env": getattr(settings, "app_env", "unknown"),
     }

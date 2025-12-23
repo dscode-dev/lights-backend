@@ -1,8 +1,9 @@
-from __future__ import annotations
-
-import asyncio
-from fastapi import WebSocket
 from typing import Set
+from fastapi import WebSocket
+import asyncio
+import logging
+
+log = logging.getLogger("ws")
 
 
 class WebSocketManager:
@@ -14,23 +15,21 @@ class WebSocketManager:
         await ws.accept()
         async with self._lock:
             self._connections.add(ws)
+        log.info("ws_connected")
 
     async def disconnect(self, ws: WebSocket) -> None:
         async with self._lock:
             self._connections.discard(ws)
+        log.info("ws_disconnected")
 
-    async def broadcast_json(self, payload: dict) -> None:
+    async def broadcast(self, message: dict) -> None:
         async with self._lock:
-            conns = list(self._connections)
+            dead = []
+            for ws in self._connections:
+                try:
+                    await ws.send_json(message)
+                except Exception:
+                    dead.append(ws)
 
-        if not conns:
-            return
-
-        # send concurrently, drop broken sockets
-        async def _send_one(c: WebSocket) -> None:
-            try:
-                await c.send_json(payload)
-            except Exception:
-                await self.disconnect(c)
-
-        await asyncio.gather(*[_send_one(c) for c in conns], return_exceptions=True)
+            for ws in dead:
+                self._connections.discard(ws)
