@@ -1,3 +1,4 @@
+# app/main.py
 from __future__ import annotations
 
 import logging
@@ -26,15 +27,16 @@ from app.services.youtube_pipeline import YouTubePipeline
 from app.ws.manager import WebSocketManager
 from app.ws.broadcaster import RedisToWebSocketBroadcaster
 
+from app.ws.esp_hub import EspWebSocketHub  # ✅ NEW
+
 from app.api.routes_ws import router as ws_router
+from app.api.routes_ws_esp import router as ws_esp_router  # ✅ NEW
 from app.api.routes_playlist import router as playlist_router
 from app.api.routes_status import router as status_router
 from app.api.routes_esp import router as esp_router
 from app.api.routes_player import router as player_router
 from app.api.routes_audio import router as audio_router
-
-# ✅ NEW
-from app.api.routes_media import router as media_router
+from app.api.routes_media import router as media_router  # ✅ você já tinha
 
 log = logging.getLogger("app")
 
@@ -93,31 +95,33 @@ async def lifespan(app: FastAPI):
     app.state.mongo_db = mongo_client[settings.mongo_db]
     log.info("mongo_connected")
 
+    # pipeline
     app.state.pipeline = YouTubePipeline(app.state.state)
     await app.state.pipeline.start()
     log.info("pipeline_initialized")
 
+    # websocket (frontend)
     app.state.ws_manager = WebSocketManager()
     app.state.broadcaster = RedisToWebSocketBroadcaster(redis, app.state.ws_manager)
+
+    # websocket (ESP) ✅ NEW
+    app.state.esp_hub = EspWebSocketHub()
 
     await bootstrap_defaults(app)
     await app.state.broadcaster.start()
     log.info("ws_broadcaster_started")
 
+    # executor (player maestro)
     app.state.executor = PlayerExecutor(
         app.state.state,
         app.state.ws_manager,
-    )   
+        app.state.esp_hub,
+    )
     log.info("executor_started")
 
     try:
         yield
     finally:
-        try:
-            await app.state.executor.stop()
-        except Exception:
-            log.exception("error_stopping_executor")
-
         try:
             await app.state.broadcaster.stop()
         except Exception:
@@ -150,14 +154,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# frontend WS
 app.include_router(ws_router)
+
+# ESP WS ✅ NEW
+app.include_router(ws_esp_router)
+
 app.include_router(playlist_router)
 app.include_router(status_router)
 app.include_router(esp_router)
 app.include_router(player_router)
 app.include_router(audio_router)
-
-# ✅ NEW: media streaming
 app.include_router(media_router)
 
 @app.get("/health")
