@@ -21,6 +21,7 @@ log = logging.getLogger("youtube.pipeline")
 # JOB MODEL
 # ==========================================================
 
+
 @dataclass
 class YouTubeJob:
     step_id: str
@@ -32,6 +33,7 @@ class YouTubeJob:
 # ==========================================================
 # PIPELINE
 # ==========================================================
+
 
 class YouTubePipeline:
     """
@@ -136,7 +138,6 @@ class YouTubePipeline:
 
         analysis = analyze_audio_file(audio_path)
 
-        # 🔽 STATUS: ready
         await upsert_step_by_id(
             self.state,
             step_id,
@@ -146,6 +147,8 @@ class YouTubePipeline:
                 "audioFile": audio_path,
                 "durationMs": analysis.duration_ms,
                 "bpm": analysis.bpm,
+                "beatMap": analysis.beat_map,
+                "energyMap": analysis.energy_map,
             },
         )
 
@@ -165,10 +168,13 @@ class YouTubePipeline:
         cmd = [
             "yt-dlp",
             "--no-playlist",
-            "-f", "bestaudio",
+            "-f",
+            "bestaudio",
             "-x",
-            "--audio-format", "wav",
-            "-o", output_tpl,
+            "--audio-format",
+            "wav",
+            "-o",
+            output_tpl,
             youtube_url,
         ]
 
