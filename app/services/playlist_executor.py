@@ -30,7 +30,7 @@ class PlaylistExecutor:
     TICK_HZ = 30  # só para "manter status" ou fallback; LEDs podem ser por frame
     MAX_FRAME_SKEW_S = 2.0  # se ficar muito tempo sem frame, para de animar
 
-    ESP_LEFT = "192.168.4.102"   # VU 0..31 / contorno
+    ESP_LEFT = "192.168.137.64"   # VU 0..31 / contorno
     ESP_RIGHT = "192.168.4.101"  # VU 0..50 / contorno
 
     def __init__(self, state: RedisState):
