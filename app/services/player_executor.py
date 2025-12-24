@@ -23,10 +23,10 @@ class PlayerExecutor:
     Player maestro:
     - Frontend: status via WS (JSON)
     - ESPs: comandos via WS TEXT
-    - LEDs seguem BEATS REAIS do áudio
+    - LEDs sincronizados com BEATS reais do áudio
     """
 
-    LED_TICK_S = 1.0 / 60.0  # 60 FPS p/ precisão visual
+    LED_TICK_S = 1.0 / 90.0  # ⚡ 90 FPS (latência bem menor)
 
     def __init__(self, state, ws, esp_hub):
         self.state = state
@@ -43,8 +43,8 @@ class PlayerExecutor:
         self._beat_map: List[int] = []
         self._beat_idx: int = 0
 
-        # VU físico
-        self._vu_max = 50  # hardware maior
+        # VU
+        self._vu_max = 50
         self._vu_peak: float = 0.0
 
         # Flood control
@@ -52,7 +52,8 @@ class PlayerExecutor:
         self._last_ct_cmd: Optional[str] = None
 
         # Contorno
-        self._contour_mode: str = "pulse"  # alterna entre pulse / flow
+        self._contour_mode: str = "flow"
+        self._last_contour_switch_ms: int = 0
 
     # =====================================================
     # PLAYER API
@@ -81,10 +82,7 @@ class PlayerExecutor:
 
         log.info(
             "step_start",
-            extra={
-                "index": index,
-                "beats": len(self._beat_map),
-            },
+            extra={"index": index, "beats": len(self._beat_map)},
         )
 
     async def pause(self):
@@ -95,7 +93,6 @@ class PlayerExecutor:
             "data": {"isPlaying": False},
         })
 
-        # zera VU e contorno
         await self._send_vu(0)
         await self._send_ct("CT:OFF")
 
@@ -130,13 +127,13 @@ class PlayerExecutor:
 
                 elapsed = self._elapsed_ms()
 
-                # processa beat real
+                # processa beats (ATAQUE IMEDIATO)
                 await self._process_beats(elapsed)
 
-                # decay contínuo do VU (efeito água)
-                self._vu_peak *= 0.88
-                level = int(self._vu_peak)
+                # DECAY mais rápido (menos atraso visual)
+                self._vu_peak *= 0.82
 
+                level = int(self._vu_peak)
                 await self._send_vu(level)
 
         except asyncio.CancelledError:
@@ -152,34 +149,35 @@ class PlayerExecutor:
         if not self._beat_map:
             return
 
-        if self._beat_idx >= len(self._beat_map):
+        while self._beat_idx < len(self._beat_map):
+            next_beat = self._beat_map[self._beat_idx]
+            if elapsed_ms < next_beat:
+                break
+
+            # 🔥 BEAT REAL
+            self._beat_idx += 1
+
+            # ATAQUE instantâneo
+            self._vu_peak = float(self._vu_max)
+
+            await self._on_beat_contour(elapsed_ms)
+
+    async def _on_beat_contour(self, elapsed_ms: int):
+        """
+        Alterna animação do contorno,
+        mas com proteção de tempo mínimo
+        """
+        if elapsed_ms - self._last_contour_switch_ms < 220:
             return
 
-        next_beat = self._beat_map[self._beat_idx]
+        self._last_contour_switch_ms = elapsed_ms
 
-        if elapsed_ms < next_beat:
-            return
-
-        # 🔥 BEAT REAL DISPAROU 🔥
-        self._beat_idx += 1
-
-        # VU ataque forte
-        self._vu_peak = float(self._vu_max)
-
-        # alterna modo de contorno
-        await self._on_beat_contour()
-
-    async def _on_beat_contour(self):
-        """
-        Alterna animações do contorno a cada beat
-        (o firmware cuida do movimento)
-        """
-        if self._contour_mode == "pulse":
-            self._contour_mode = "flow"
-            cmd = "CT:SOLID:180"  # azul/roxo
-        else:
+        if self._contour_mode == "flow":
             self._contour_mode = "pulse"
-            cmd = "CT:SOLID:200"  # roxo mais forte
+            cmd = "CT:SOLID:200"  # roxo
+        else:
+            self._contour_mode = "flow"
+            cmd = "CT:SOLID:180"  # azul
 
         await self._send_ct(cmd)
 
