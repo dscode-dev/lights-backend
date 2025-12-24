@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from typing import List
 
 import librosa
 import numpy as np
@@ -13,8 +14,8 @@ log = logging.getLogger("audio.analyzer")
 class AudioAnalysisResult:
     duration_ms: int
     bpm: int
-    beat_map: list[int]
-    energy_map: list[dict]
+    beat_map: List[int]
+    energy_map: List[float]
 
 
 def analyze_audio_file(path: str) -> AudioAnalysisResult:
@@ -25,47 +26,37 @@ def analyze_audio_file(path: str) -> AudioAnalysisResult:
     duration_s = librosa.get_duration(y=y, sr=sr)
     duration_ms = int(duration_s * 1000)
 
-    # ==========================
-    # BPM + BEATS
-    # ==========================
+    # =========================
+    # BEATS
+    # =========================
     tempo, beats = librosa.beat.beat_track(y=y, sr=sr)
     beat_times = librosa.frames_to_time(beats, sr=sr)
     beat_map = [int(t * 1000) for t in beat_times]
 
-    # ==========================
-    # ENERGY (RMS)
-    # ==========================
-    hop_length = 512
-    rms = librosa.feature.rms(y=y, hop_length=hop_length)[0]
-    times = librosa.frames_to_time(
-        np.arange(len(rms)),
-        sr=sr,
-        hop_length=hop_length,
-    )
+    # =========================
+    # ENERGIA (RMS)
+    # =========================
+    rms = librosa.feature.rms(y=y, frame_length=2048, hop_length=512)[0]
 
-    rms_max = float(np.max(rms)) or 1.0
+    # normaliza energia (sensível até música baixa)
+    rms = rms / (np.max(rms) + 1e-6)
+    rms = np.sqrt(rms)  # 🔥 aumenta sensibilidade em volumes baixos
 
-    energy_map = [
-        {
-            "t": int(t * 1000),
-            "e": float(v / rms_max),
-        }
-        for t, v in zip(times, rms)
-    ]
+    energy_map = rms.tolist()
 
     log.info(
         "audio_analysis_ok",
         extra={
             "duration_ms": duration_ms,
-            "bpm": int(round(tempo)),
+            "bpm": int(round(float(tempo))),
             "beats": len(beat_map),
-            "energy_points": len(energy_map),
+            "energy_frames": len(energy_map),
         },
     )
 
     return AudioAnalysisResult(
         duration_ms=duration_ms,
-        bpm=int(round(tempo)),
+        bpm=int(round(float(tempo))),
         beat_map=beat_map,
         energy_map=energy_map,
     )

@@ -141,15 +141,15 @@ class YouTubePipeline:
         await upsert_step_by_id(
             self.state,
             step_id,
-            {
-                "status": "ready",
-                "progress": 1.0,
-                "audioFile": audio_path,
-                "durationMs": analysis.duration_ms,
-                "bpm": analysis.bpm,
-                "beatMap": analysis.beat_map,
-                "energyMap": analysis.energy_map,
-            },
+        {
+            "status": "ready",
+            "progress": 1.0,
+            "audioFile": audio_path,
+            "durationMs": analysis.duration_ms,
+            "bpm": analysis.bpm,
+            "beatMap": analysis.beat_map,
+            "energyMap": analysis.energy_map,
+        },
         )
 
         log.info("pipeline_completed", extra={"step_id": step_id})
