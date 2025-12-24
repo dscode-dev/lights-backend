@@ -76,7 +76,10 @@ class OpenAIClient:
             "temperature": 0.2,
         }
 
-        log.info("openai_request_start", extra={"model": settings.openai_model, "title": title})
+        log.info(
+            "openai_request_start",
+            extra={"model": settings.openai_model, "title": title},
+        )
 
         async with httpx.AsyncClient(timeout=settings.openai_timeout_s) as client:
             r = await client.post(
@@ -87,11 +90,7 @@ class OpenAIClient:
             r.raise_for_status()
             data = r.json()
 
-        content = (
-            data.get("choices", [{}])[0]
-            .get("message", {})
-            .get("content", "")
-        )
+        content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
 
         preview = content[:300].replace("\n", "\\n")
         log.info("openai_response_raw", extra={"preview": preview})
@@ -117,3 +116,30 @@ class OpenAIClient:
             raise ValueError("Could not find JSON object in OpenAI response")
 
         return json.loads(m.group(0))
+
+    async def generate_show_plan(
+        self, *, title: str, genre: str, duration_ms: int, bpm: int
+    ) -> dict:
+        prompt = f"""
+        Você é um diretor de show de LEDs profissional.
+    
+        Crie:
+        1) presets de efeitos
+        2) timeline com mudanças ao longo da música
+    
+        Formato JSON:
+    
+        {{
+          "presets": {{
+            "intro": {{ "vu": {{...}}, "contour": {{...}} }},
+            "drop": {{ "vu": {{...}}, "contour": {{...}} }},
+            "final": {{ "vu": {{...}}, "contour": {{...}} }}
+          }},
+          "timeline": [
+            {{ "atMs": 0, "presetName": "intro" }},
+            {{ "atMs": {duration_ms * 0.3:.0f}, "presetName": "drop" }},
+            {{ "atMs": {duration_ms * 0.8:.0f}, "presetName": "final" }}
+          ]
+        }}
+        """
+        return await self._call_openai(prompt)

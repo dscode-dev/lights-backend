@@ -1,23 +1,14 @@
-from __future__ import annotations
-
-import logging
-from fastapi import APIRouter, Depends, HTTPException
-
-from app.api.deps import get_player_executor
+from fastapi import APIRouter, Depends
 from app.services.playlist_executor import PlaylistExecutor
-
-log = logging.getLogger("api.player")
+from app.api.deps import get_player_executor
 
 router = APIRouter(prefix="/player", tags=["player"])
 
 
 @router.post("/play/{index}")
 async def play(index: int, executor: PlaylistExecutor = Depends(get_player_executor)):
-    try:
-        await executor.play_index(index)
-        return {"ok": True}
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    await executor.play_index(index)
+    return {"ok": True}
 
 
 @router.post("/pause")
@@ -34,5 +25,5 @@ async def resume(executor: PlaylistExecutor = Depends(get_player_executor)):
 
 @router.post("/stop")
 async def stop(executor: PlaylistExecutor = Depends(get_player_executor)):
-    await executor.stop_playback()
+    await executor.stop()
     return {"ok": True}
