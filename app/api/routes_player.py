@@ -1,44 +1,38 @@
 from __future__ import annotations
 
+import logging
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
 
-from app.api.deps import get_state, get_player_executor
-from app.state.redis_state import RedisState
-from app.state.playlist_state import get_playlist
+from app.api.deps import get_player_executor
 from app.services.playlist_executor import PlaylistExecutor
 
-router = APIRouter(tags=["player"])
+log = logging.getLogger("api.player")
+
+router = APIRouter(prefix="/player", tags=["player"])
 
 
-class PlayStepRequest(BaseModel):
-    index: int
+@router.post("/play/{index}")
+async def play(index: int, executor: PlaylistExecutor = Depends(get_player_executor)):
+    try:
+        await executor.play_index(index)
+        return {"ok": True}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
-@router.post("/play-step")
-async def play_step(
-    payload: PlayStepRequest,
-    state: RedisState = Depends(get_state),
-    executor: PlaylistExecutor = Depends(get_player_executor),
-):
-    steps = await get_playlist(state)
+@router.post("/pause")
+async def pause(executor: PlaylistExecutor = Depends(get_player_executor)):
+    await executor.pause()
+    return {"ok": True}
 
-    if payload.index < 0 or payload.index >= len(steps):
-        raise HTTPException(status_code=404, detail="Invalid index")
 
-    step = steps[payload.index]
-    if step.status == "processing":
-        raise HTTPException(status_code=409, detail="Step is processing")
-    if step.status == "error":
-        raise HTTPException(status_code=409, detail="Step errored")
-
-    await executor.play_index(payload.index)
+@router.post("/resume")
+async def resume(executor: PlaylistExecutor = Depends(get_player_executor)):
+    await executor.resume()
     return {"ok": True}
 
 
 @router.post("/stop")
-async def stop(
-    executor: PlaylistExecutor = Depends(get_player_executor),
-):
+async def stop(executor: PlaylistExecutor = Depends(get_player_executor)):
     await executor.stop_playback()
     return {"ok": True}
