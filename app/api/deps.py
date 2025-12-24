@@ -1,7 +1,8 @@
 from fastapi import Request, WebSocket
 
 from app.state.redis_state import RedisState
-from app.services.playlist_executor import PlaylistExecutor
+# from app.services.playlist_executor import PlaylistExecutor
+from app.services.player_executor import PlayerExecutor
 from app.services.youtube_pipeline import YouTubePipeline
 from app.ws.manager import WebSocketManager
 
@@ -14,7 +15,7 @@ def get_state(request: Request) -> RedisState:
     return request.app.state.state
 
 
-def get_player_executor(request: Request) -> PlaylistExecutor:
+def get_player_executor(request: Request) -> PlayerExecutor:
     return request.app.state.executor
 
 
@@ -30,7 +31,7 @@ def get_ws_manager(request: Request) -> WebSocketManager:
 # WEBSOCKET DEPENDENCIES
 # =========================
 
-def get_player_executor_ws(websocket: WebSocket) -> PlaylistExecutor:
+def get_player_executor_ws(websocket: WebSocket) -> PlayerExecutor:
     return websocket.app.state.executor
 
 

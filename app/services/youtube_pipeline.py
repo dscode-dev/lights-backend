@@ -4,237 +4,210 @@ import asyncio
 import logging
 import os
 import subprocess
-import uuid
 from dataclasses import dataclass
 from typing import Optional
 
 from app.core.config import settings
-from app.state.redis_keys import EVENTS_CHANNEL
 from app.state.redis_state import RedisState
-from app.state.playlist_state import get_playlist, save_playlist
-from app.services.audio_analyzer import AudioAnalyzer
-from app.services.openai_client import OpenAIClient
+from app.state.playlist_state import (
+    upsert_step_by_id,
+)
+from app.audio.analyzer import analyze_audio_file
 
 log = logging.getLogger("youtube.pipeline")
 
 
-# =========================
-# JOB
-# =========================
+# ==========================================================
+# JOB MODEL
+# ==========================================================
 
 @dataclass
-class AddFromYouTubeJob:
+class YouTubeJob:
     step_id: str
-    title: str
-    genre: str
-    palette: str
     youtube_url: str
-    use_ai: bool = True
+    title: str
+    use_ai: bool
 
 
-# =========================
+# ==========================================================
 # PIPELINE
-# =========================
+# ==========================================================
 
 class YouTubePipeline:
+    """
+    Pipeline responsável por:
+    - Baixar áudio do YouTube
+    - Analisar áudio (energia, bpm, etc)
+    - Atualizar step no Redis
+    """
+
     def __init__(self, state: RedisState):
         self.state = state
-        self.analyzer = AudioAnalyzer()
-        self.ai = OpenAIClient()
-
-        self._queue: asyncio.Queue[AddFromYouTubeJob] = asyncio.Queue()
-        self._workers: list[asyncio.Task] = []
+        self._queue: asyncio.Queue[YouTubeJob] = asyncio.Queue()
+        self._task: Optional[asyncio.Task] = None
         self._running = False
+
+        self.media_dir = settings.media_dir
+
+    # ======================================================
+    # LIFECYCLE
+    # ======================================================
 
     async def start(self):
         if self._running:
             return
         self._running = True
-        self._workers.append(asyncio.create_task(self._worker()))
+        self._task = asyncio.create_task(self._worker())
         log.info("pipeline_started")
 
     async def stop(self):
         self._running = False
-        for w in self._workers:
-            w.cancel()
+        if self._task:
+            self._task.cancel()
 
-    async def dispatch(self, job: AddFromYouTubeJob):
+    # ======================================================
+    # PUBLIC API
+    # ======================================================
+
+    async def enqueue(
+        self,
+        *,
+        step_id: str,
+        youtube_url: str,
+        title: str,
+        use_ai: bool = False,
+    ):
+        job = YouTubeJob(
+            step_id=step_id,
+            youtube_url=youtube_url,
+            title=title,
+            use_ai=use_ai,
+        )
         await self._queue.put(job)
-        log.info("pipeline_job_queued", extra={"stepId": job.step_id})
 
-    # =========================
+    # ======================================================
     # WORKER
-    # =========================
+    # ======================================================
 
     async def _worker(self):
         while self._running:
             job = await self._queue.get()
             try:
-                await self._run_job(job)
-            except Exception as e:
-                await self._fail(job.step_id, str(e))
-                log.exception("pipeline_failed", extra={"stepId": job.step_id})
+                await asyncio.wait_for(
+                    self._run_job(job),
+                    timeout=settings.pipeline_job_timeout_s,
+                )
+            except Exception:
+                log.exception("pipeline_failed")
+                await upsert_step_by_id(
+                    self.state,
+                    job.step_id,
+                    {
+                        "status": "error",
+                        "progress": 0,
+                    },
+                )
             finally:
                 self._queue.task_done()
 
-    # =========================
-    # CORE LOGIC
-    # =========================
+    # ======================================================
+    # JOB EXECUTION
+    # ======================================================
 
-    async def _run_job(self, job: AddFromYouTubeJob):
-        log.info("pipeline_processing", extra={"stepId": job.step_id})
+    async def _run_job(self, job: YouTubeJob):
+        step_id = job.step_id
 
-        await self._progress(job.step_id, 0.05, "downloading_audio")
-
-        audio_path = await self._download_audio(job.youtube_url, job.step_id)
-
-        await self._progress(job.step_id, 0.25, "analyzing_audio")
-
-        analysis = self.analyzer.analyze(audio_path)
-        duration_ms = int(analysis["durationMs"])
-
-        await self._progress(job.step_id, 0.55, "building_led_plan")
-
-        led_plan = await self._build_led_plan(
-            title=job.title,
-            genre=job.genre,
-            palette=job.palette,
-            duration_ms=duration_ms,
-            use_ai=job.use_ai,
+        # 🔽 STATUS: downloading
+        await upsert_step_by_id(
+            self.state,
+            step_id,
+            {"status": "downloading", "progress": 0.1},
         )
 
-        await self._progress(job.step_id, 0.9, "finalizing")
+        # ✅ AQUI ESTAVA O BUG
+        audio_path = await self._download_audio(job.youtube_url, step_id)
 
-        await self._mark_ready(
-            step_id=job.step_id,
-            duration_ms=duration_ms,
-            led_plan=led_plan,
+        # 🔽 STATUS: analyzing
+        await upsert_step_by_id(
+            self.state,
+            step_id,
+            {"status": "analyzing", "progress": 0.5},
         )
 
-        await self._progress(job.step_id, 1.0, "ready")
-        log.info("pipeline_completed", extra={"stepId": job.step_id})
+        analysis = analyze_audio_file(audio_path)
 
-    # =========================
-    # LED PLAN
-    # =========================
-
-    async def _build_led_plan(
-        self,
-        *,
-        title: str,
-        genre: str,
-        palette: str,
-        duration_ms: int,
-        use_ai: bool,
-    ) -> dict:
-        """
-        Plano simples, bonito e determinístico.
-        """
-        # fallback estável
-        base_plan = {
-            "presets": {
-                "intro": {
-                    "id": "intro",
-                    "contour": {"mode": "pulse", "hue": 160, "speed": 0.8},
-                },
-                "main": {
-                    "id": "main",
-                    "vu": {"level": 22},
-                    "contour": {"mode": "solid", "hue": 160},
-                },
-                "outro": {
-                    "id": "outro",
-                    "contour": {"mode": "pulse", "hue": 160, "speed": 0.4},
-                },
+        # 🔽 STATUS: ready
+        await upsert_step_by_id(
+            self.state,
+            step_id,
+            {
+                "status": "ready",
+                "progress": 1.0,
+                "audioFile": audio_path,
+                "durationMs": analysis.duration_ms,
+                "bpm": analysis.bpm,
             },
-            "timeline": [
-                {"from": 0, "to": int(duration_ms * 0.15), "preset": "intro"},
-                {"from": int(duration_ms * 0.15), "to": int(duration_ms * 0.9), "preset": "main"},
-                {"from": int(duration_ms * 0.9), "to": duration_ms, "preset": "outro"},
-            ],
-        }
+        )
 
-        if not use_ai:
-            return base_plan
+        log.info("pipeline_completed", extra={"step_id": step_id})
 
-        try:
-            ai_plan = await self.ai.led_plan(
-                title=title,
-                genre=genre,
-                palette=palette,
-                duration_ms=duration_ms,
-                topology={"simple": True},
-            )
-            return ai_plan or base_plan
-        except Exception:
-            log.exception("ai_led_plan_failed")
-            return base_plan
-
-    # =========================
-    # DOWNLOAD
-    # =========================
+    # ======================================================
+    # AUDIO DOWNLOAD
+    # ======================================================
 
     async def _download_audio(self, youtube_url: str, step_id: str) -> str:
-        os.makedirs(settings.media_dir, exist_ok=True)
-        out = os.path.join(settings.media_dir, f"{step_id}.wav")
+        loop = asyncio.get_running_loop()
+        os.makedirs(self.media_dir, exist_ok=True)
+
+        output_tpl = f"./media/{step_id}.%(ext)s"
+        audio_path = f"./media/{step_id}.wav"
 
         cmd = [
-            settings.ytdlp_bin,
+            "yt-dlp",
+            "--no-playlist",
+            "-f", "bestaudio",
             "-x",
             "--audio-format", "wav",
-            "-o", out,
+            "-o", output_tpl,
             youtube_url,
         ]
 
-        log.info("audio_download_start", extra={"stepId": step_id})
-        subprocess.run(cmd, check=True)
-        log.info("audio_download_done", extra={"stepId": step_id})
-
-        return out
-
-    # =========================
-    # REDIS STATE
-    # =========================
-
-    async def _mark_ready(self, *, step_id: str, duration_ms: int, led_plan: dict):
-        steps = await get_playlist(self.state)
-        for i, s in enumerate(steps):
-            if s.id == step_id:
-                s.status = "ready"
-                s.durationMs = duration_ms
-                s.ledPlan = led_plan
-                steps[i] = s
-                await save_playlist(self.state, steps)
-
-                await self.state.publish_event(
-                    EVENTS_CHANNEL,
-                    {"type": "playlist", "data": {"steps": [x.model_dump() for x in steps]}},
-                )
-                return
-
-    async def _fail(self, step_id: str, error: str):
-        steps = await get_playlist(self.state)
-        for i, s in enumerate(steps):
-            if s.id == step_id:
-                s.status = "error"
-                s.error = error
-                steps[i] = s
-                await save_playlist(self.state, steps)
-                await self.state.publish_event(
-                    EVENTS_CHANNEL,
-                    {"type": "playlist_error", "data": {"stepId": step_id, "error": error}},
-                )
-                return
-
-    async def _progress(self, step_id: str, progress: float, stage: str):
-        await self.state.publish_event(
-            EVENTS_CHANNEL,
-            {
-                "type": "playlist_progress",
-                "data": {
-                    "stepId": step_id,
-                    "progress": progress,
-                    "stage": stage,
-                },
-            },
+        log.info(
+            "audio_download_cmd",
+            extra={"cmd": " ".join(cmd)},
         )
+
+        def _run():
+            return subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+
+        proc = await loop.run_in_executor(None, _run)
+
+        # ⚠️ NÃO trata warning como erro
+        if proc.returncode != 0:
+            log.error(
+                "audio_download_nonzero_exit",
+                extra={
+                    "returncode": proc.returncode,
+                    "output": proc.stdout,
+                },
+            )
+            raise RuntimeError("yt-dlp falhou ao baixar o áudio")
+
+        if not os.path.exists(audio_path):
+            log.error(
+                "audio_file_missing",
+                extra={"expected": audio_path, "output": proc.stdout},
+            )
+            raise RuntimeError("Arquivo WAV não encontrado após download")
+
+        log.info(
+            "audio_download_ok",
+            extra={"path": audio_path},
+        )
+
+        return audio_path

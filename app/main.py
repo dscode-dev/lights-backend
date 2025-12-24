@@ -20,7 +20,7 @@ from app.state.redis_keys import (
 )
 from app.state.redis_state import RedisState
 
-from app.services.playlist_executor import PlaylistExecutor
+from app.services.player_executor import PlayerExecutor
 from app.services.youtube_pipeline import YouTubePipeline
 
 from app.ws.manager import WebSocketManager
@@ -31,12 +31,16 @@ from app.api.routes_playlist import router as playlist_router
 from app.api.routes_status import router as status_router
 from app.api.routes_esp import router as esp_router
 from app.api.routes_player import router as player_router
+from app.api.routes_audio import router as audio_router
+
+# ✅ NEW
+from app.api.routes_media import router as media_router
 
 log = logging.getLogger("app")
 
 
 async def bootstrap_defaults(app: FastAPI) -> None:
-    state: RedisState = app.state.state  # type: ignore
+    state: RedisState = app.state.state  # type: ignore[attr-defined]
 
     if await state.get_json(PLAYLIST_STEPS_KEY) is None:
         await state.set_json(PLAYLIST_STEPS_KEY, [])
@@ -48,7 +52,7 @@ async def bootstrap_defaults(app: FastAPI) -> None:
     if await state.get_json(PLAYER_STATUS_KEY) is None:
         default_status = {
             "isPlaying": False,
-            "activeIndex": -1,
+            "activeIndex": 0,
             "elapsedMs": 0,
             "bpm": 120,
             "palette": "blue",
@@ -75,6 +79,7 @@ async def lifespan(app: FastAPI):
     log.info("app_starting")
 
     os.makedirs(settings.media_dir, exist_ok=True)
+    os.makedirs(settings.cache_dir, exist_ok=True)
 
     redis = Redis.from_url(settings.redis_url, decode_responses=False)
     await redis.ping()
@@ -88,12 +93,10 @@ async def lifespan(app: FastAPI):
     app.state.mongo_db = mongo_client[settings.mongo_db]
     log.info("mongo_connected")
 
-    # PIPELINE
     app.state.pipeline = YouTubePipeline(app.state.state)
     await app.state.pipeline.start()
     log.info("pipeline_initialized")
 
-    # WEBSOCKET
     app.state.ws_manager = WebSocketManager()
     app.state.broadcaster = RedisToWebSocketBroadcaster(redis, app.state.ws_manager)
 
@@ -101,9 +104,10 @@ async def lifespan(app: FastAPI):
     await app.state.broadcaster.start()
     log.info("ws_broadcaster_started")
 
-    # ✅ EXECUTOR — CORREÇÃO AQUI
-    app.state.executor = PlaylistExecutor(app.state.state)
-    await app.state.executor.start()
+    app.state.executor = PlayerExecutor(
+        app.state.state,
+        app.state.ws_manager,
+    )   
     log.info("executor_started")
 
     try:
@@ -151,7 +155,10 @@ app.include_router(playlist_router)
 app.include_router(status_router)
 app.include_router(esp_router)
 app.include_router(player_router)
+app.include_router(audio_router)
 
+# ✅ NEW: media streaming
+app.include_router(media_router)
 
 @app.get("/health")
 def health():
