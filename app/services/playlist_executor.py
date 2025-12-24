@@ -3,107 +3,90 @@ from __future__ import annotations
 import asyncio
 import time
 import logging
-from typing import Optional
+from typing import Optional, Dict, Any
 
 from app.state.redis_state import RedisState
-from app.state.redis_keys import PLAYER_STATUS_KEY, PLAYLIST_STEPS_KEY, EVENTS_CHANNEL
+from app.state.redis_keys import (
+    PLAYER_STATUS_KEY,
+    PLAYLIST_STEPS_KEY,
+    EVENTS_CHANNEL,
+)
 from app.models.playlist import PlaylistStep
 from app.services.esp_udp import EspUdpClient
 
 log = logging.getLogger("player.executor")
 
 
-def clamp(v: int, lo: int, hi: int) -> int:
-    return max(lo, min(hi, v))
+def clamp01(v: float) -> float:
+    try:
+        return max(0.0, min(1.0, float(v)))
+    except Exception:
+        return 0.0
 
 
 class PlaylistExecutor:
     """
-    Executor responsável por:
-    - Manter o tempo do show
-    - Sincronizar LEDs com BPM / beat
-    - Publicar status continuamente
+    Executor REATIVO:
+    - Não gera ritmo fake
+    - Não calcula BPM
+    - Reage aos frames vindos do frontend (player_audio_frame)
     """
 
-    TICK_HZ = 30  # frequência do loop (30Hz)
+    ESP_LEFT = "192.168.4.102"
+    ESP_RIGHT = "192.168.4.101"
 
-    # IPs fixos (por enquanto)
-    ESP_LEFT = "192.168.4.102"   # VU esquerdo (0..31)
-    ESP_RIGHT = "192.168.4.101"  # VU direito  (0..50)
+    def __init__(self, state):
+        # 🔒 blindagem absoluta
+        if hasattr(state, "get_json"):
+            self.state: RedisState = state
+        elif hasattr(state, "state") and hasattr(state.state, "get_json"):
+            self.state = state.state
+        else:
+            raise RuntimeError("PlaylistExecutor recebeu state inválido")
 
-    def __init__(self, state: RedisState):
-        self.state = state
         self.udp = EspUdpClient()
 
-        self._task: Optional[asyncio.Task] = None
-        self._running: bool = False
-        self.is_paused: bool = False
-
+        self._running = False
         self._active_index: Optional[int] = None
         self._started_at: float = 0.0
-        self._last_ct_hue: Optional[int] = None
+        self.is_paused: bool = False
+
+        # 🔥 último frame de áudio recebido
+        self._last_frame: Optional[Dict[str, Any]] = None
 
     # =====================================================
     # LIFECYCLE
     # =====================================================
 
     async def start(self):
-        """
-        Inicia o loop contínuo do executor.
-        Só roda uma vez.
-        """
-        if self._running:
-            return
-
         self._running = True
-        self._task = asyncio.create_task(self._loop())
         log.info("executor_started")
 
     async def stop(self):
-        """
-        Para completamente o executor.
-        """
         self._running = False
-        if self._task:
-            self._task.cancel()
-            self._task = None
-
-        await self._send_vu(0, 0)
-        await self._send_ct(off=True)
-        log.info("executor_stopped")
 
     # =====================================================
-    # CONTROLES PÚBLICOS
+    # PLAYER CONTROLS
     # =====================================================
 
     async def play_index(self, index: int):
-        """
-        Inicia a execução de um step específico.
-        """
-        # 🔥 GARANTE QUE O LOOP ESTÁ RODANDO
-        if not self._running:
-            await self.start()
-
         steps = await self._get_steps()
         if index < 0 or index >= len(steps):
             return
 
         step = steps[index]
-
         self._active_index = index
         self._started_at = time.monotonic()
         self.is_paused = False
-        self._last_ct_hue = None
+        self._last_frame = None
 
-        # reset LEDs
-        await self._send_ct(off=True)
-        await self._send_vu(0, 0)
+        await self._send_all_off()
 
         await self._publish_status(
             isPlaying=True,
             activeIndex=index,
             elapsedMs=0,
-            bpm=step.bpm or 120,
+            bpm=step.bpm,
             palette=step.palette,
             currentTitle=step.title,
             currentType=step.type,
@@ -112,141 +95,106 @@ class PlaylistExecutor:
         log.info("step_start", extra={"stepId": step.id})
 
     async def pause(self):
+        if not self._active_index and self._active_index != 0:
+            return
+        self.is_paused = True
+        await self._publish_status(isPlaying=False)
+
+    async def resume(self):
+        if self._active_index is None:
+            return
+        self.is_paused = False
+        await self._publish_status(isPlaying=True)
+
+    async def stop_playback(self):
+        await self._send_all_off()
+        self._active_index = None
+        self._last_frame = None
+        await self._publish_status(isPlaying=False, elapsedMs=0)
+
+    # =====================================================
+    # 🎧 AUDIO FRAME (VINDO DO FRONTEND)
+    # =====================================================
+
+    async def on_player_audio_frame(
+        self,
+        *,
+        step_index: int,
+        elapsed_ms: int,
+        energy: float,
+        bands: Dict[str, float],
+        beat: bool,
+    ):
+        """
+        🔥 Este é o coração do sistema.
+        Chamado VIA WS pelo frontend.
+        """
+
         if not self._running:
             return
 
-        self.is_paused = True
-        await self._publish_status(isPlaying=False)
-        log.info("step_paused")
-
-    async def resume(self):
-        if not self._running or not self.is_paused:
+        if self.is_paused:
             return
 
-        self.is_paused = False
-        await self._publish_status(isPlaying=True)
-        log.info("step_resumed")
+        if step_index != self._active_index:
+            return
 
-    async def stop_playback(self):
-        """
-        Finaliza o step atual.
-        """
-        await self._send_vu(0, 0)
-        await self._send_ct(off=True)
+        self._last_frame = {
+            "energy": clamp01(energy),
+            "bands": {
+                "bass": clamp01(bands.get("bass", 0)),
+                "mid": clamp01(bands.get("mid", 0)),
+                "treble": clamp01(bands.get("treble", 0)),
+            },
+            "beat": bool(beat),
+        }
 
-        self._active_index = None
-        self.is_paused = False
-
-        await self._publish_status(
-            isPlaying=False,
-            elapsedMs=0,
-        )
-
-        log.info("step_finished")
+        await self._render_frame(elapsed_ms)
 
     # =====================================================
-    # LOOP PRINCIPAL (🔥 AQUI ESTAVA O BUG)
+    # 🎨 RENDER ENGINE
     # =====================================================
 
-    async def _loop(self):
-        interval = 1 / self.TICK_HZ
-        log.info("executor_loop_started")
-
-        while self._running:
-            try:
-                if self.is_paused:
-                    await asyncio.sleep(interval)
-                    continue
-
-                await self._tick()
-            except Exception:
-                log.exception("executor_tick_error")
-
-            # ⚠️ ESSENCIAL: sleep DENTRO do loop
-            await asyncio.sleep(interval)
-
-    async def _tick(self):
-        status = await self.state.get_json(PLAYER_STATUS_KEY)
-        if not status or not status.get("isPlaying"):
+    async def _render_frame(self, elapsed_ms: int):
+        if not self._last_frame:
             return
 
-        if self._active_index is None:
-            return
+        energy = self._last_frame["energy"]
+        bands = self._last_frame["bands"]
+        beat = self._last_frame["beat"]
 
-        steps = await self._get_steps()
-        if self._active_index >= len(steps):
-            return
-
-        step = steps[self._active_index]
-
-        elapsed = int((time.monotonic() - self._started_at) * 1000)
-
-        # publica tempo
-        await self._publish_status(elapsedMs=elapsed)
-
-        # ==========================
-        # VU (beat-based por enquanto)
-        # ==========================
-        bpm = step.bpm or 120
-        beat_ms = 60000 / bpm
-        phase = (elapsed % beat_ms) / beat_ms
-
-        vu_left = clamp(int(phase * 31), 0, 31)
-        vu_right = clamp(int(phase * 50), 0, 50)
+        # ===== VU (reativo de verdade) =====
+        vu_left = int(bands["bass"] * 31)
+        vu_right = int(bands["mid"] * 50)
 
         await self._send_vu(vu_left, vu_right)
 
-        # ==========================
-        # CONTORNO (palette)
-        # ==========================
-        hue = self._palette_to_hue(step.palette)
-        if hue != self._last_ct_hue:
-            await self._send_ct(hue=hue)
-            self._last_ct_hue = hue
+        # ===== CONTORNO DANÇANTE =====
+        if beat:
+            hue = self._palette_to_hue("orange")
+        else:
+            hue = self._palette_to_hue("blue")
 
-        # ==========================
-        # FIM DO STEP
-        # ==========================
-        if step.durationMs and elapsed >= step.durationMs:
-            await self.stop_playback()
+        brightness = int(energy * 255)
+        await self._send_ct(hue=hue, brightness=brightness)
+
+        await self._publish_status(elapsedMs=elapsed_ms)
 
     # =====================================================
-    # LED COMMANDS
+    # LED IO
     # =====================================================
 
     async def _send_vu(self, left: int, right: int):
         await self.udp.send(self.ESP_LEFT, f"VU:{left}")
         await self.udp.send(self.ESP_RIGHT, f"VU:{right}")
 
-    async def _send_ct(self, *, hue: Optional[int] = None, off: bool = False):
-        if off:
-            await self.udp.send(self.ESP_LEFT, "CT:OFF")
-            await self.udp.send(self.ESP_RIGHT, "CT:OFF")
-        elif hue is not None:
-            await self.udp.send(self.ESP_LEFT, f"CT:SOLID:{hue}")
-            await self.udp.send(self.ESP_RIGHT, f"CT:SOLID:{hue}")
+    async def _send_ct(self, *, hue: int, brightness: int):
+        await self.udp.send(self.ESP_LEFT, f"CT:SOLID:{hue}:{brightness}")
+        await self.udp.send(self.ESP_RIGHT, f"CT:SOLID:{hue}:{brightness}")
 
-    # =====================================================
-    # STATUS / STATE
-    # =====================================================
-
-    async def _publish_status(self, **fields):
-        status = await self.state.get_json(PLAYER_STATUS_KEY) or {}
-        status.update(fields)
-
-        await self.state.set_json(PLAYER_STATUS_KEY, status)
-        await self.state.publish_event(
-            EVENTS_CHANNEL,
-            {"type": "status", "data": status},
-        )
-
-    async def _get_steps(self) -> list[PlaylistStep]:
-        raw = await self.state.get_json(PLAYLIST_STEPS_KEY) or []
-        return [PlaylistStep(**s) for s in raw]
-
-    # =====================================================
-    # UTILS
-    # =====================================================
+    async def _send_all_off(self):
+        await self.udp.send(self.ESP_LEFT, "ALL:OFF")
+        await self.udp.send(self.ESP_RIGHT, "ALL:OFF")
 
     def _palette_to_hue(self, palette: str) -> int:
         return {
@@ -255,3 +203,19 @@ class PlaylistExecutor:
             "green": 96,
             "orange": 24,
         }.get(palette, 160)
+
+    # =====================================================
+    # STATE
+    # =====================================================
+
+    async def _get_steps(self) -> list[PlaylistStep]:
+        raw = await self.state.get_json(PLAYLIST_STEPS_KEY) or []
+        return [PlaylistStep(**s) for s in raw]
+
+    async def _publish_status(self, **fields):
+        status = await self.state.get_json(PLAYER_STATUS_KEY) or {}
+        status.update(fields)
+        await self.state.set_json(PLAYER_STATUS_KEY, status)
+        await self.state.publish_event(
+            EVENTS_CHANNEL, {"type": "status", "data": status}
+        )
