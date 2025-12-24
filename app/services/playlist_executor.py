@@ -20,55 +20,23 @@ def clamp(v: int, lo: int, hi: int) -> int:
 class PlaylistExecutor:
     TICK_HZ = 30
 
-    ESP_LEFT = "192.168.4.102"  # 4 fitas → 0..31
+    # ⚠️ ideal: mover isso pra settings/env, mas vou manter como você fez
+    ESP_LEFT = "192.168.137.64"   # 4 fitas → 0..31
     ESP_RIGHT = "192.168.4.101"  # 2 fitas → 0..50
 
     def __init__(self, state: RedisState):
         self.state = state
         self.udp = EspUdpClient()
+
         self._task: Optional[asyncio.Task] = None
         self._running = False
+
         self.is_paused: bool = False
         self._active_index: Optional[int] = None
         self._started_at = 0.0
         self._last_ct_hue: Optional[int] = None
-        
-    async def _publish_status_safe(self):
-        """
-        Compat layer: em algumas versões do projeto, o método se chama diferente.
-        Aqui tentamos publicar o status sem quebrar.
-        """
-        # 1) método mais comum em executores
-        fn = getattr(self, "emit_status", None)
-        if callable(fn):
-            await fn()
-            return
-    
-        # 2) nomes alternativos possíveis
-        for name in ("publish_status", "_publish_status", "broadcast_status", "_broadcast_status"):
-            fn2 = getattr(self, name, None)
-            if callable(fn2):
-                await fn2()
-                return
-    
-        # 3) fallback: escreve direto no RedisState (se existir)
-        # Ajuste os campos conforme seu contrato PlayerStatus
-        if hasattr(self, "state") and self.state:
-            try:
-                await self.state.set_player_status(
-                    {
-                        "isPlaying": False,
-                        "activeIndex": self._active_index if self._active_index is not None else -1,
-                        "elapsedMs": int(max(0.0, (asyncio.get_event_loop().time() - self._started_at) * 1000)),
-                        "bpm": 0,
-                        "palette": "blue",
-                        "currentTitle": "",
-                        "currentType": "pause",
-                    }
-                )
-            except Exception:
-                # não derruba o executor por falha de publish
-                log.exception("publish_status_fallback_failed")
+
+        self._last_tick_log = 0.0  # evitar flood de log
 
     async def start(self):
         if self._running:
@@ -81,30 +49,56 @@ class PlaylistExecutor:
         self._running = False
         if self._task:
             self._task.cancel()
+            self._task = None
+        log.info("executor_stopped")
 
     async def pause(self):
         if not self._running:
             return
-
         self.is_paused = True
-        await self._publish_status_safe()
+        await self._publish_status(isPlaying=False)  # pausa = para o "clock" do show
+        log.info("executor_paused", extra={"activeIndex": self._active_index})
 
     async def resume(self):
         if not self._running:
             return
-
         if not self.is_paused:
             return
-
         self.is_paused = False
-        await self.emit_status()
+
+        # ao retomar, mantém o step atual e reseta started_at para não "pular" tempo
+        self._started_at = time.monotonic()
+
+        await self._publish_status(isPlaying=True)
+        log.info("executor_resumed", extra={"activeIndex": self._active_index})
 
     async def play_index(self, index: int):
         steps = await self._get_steps()
+        if index < 0 or index >= len(steps):
+            log.warning("play_index_out_of_range", extra={"index": index, "len": len(steps)})
+            return
+
         step = steps[index]
+
+        # Se o seu modelo tem status, evita tocar step não pronto
+        step_status = getattr(step, "status", None)
+        if step_status and step_status not in ("ready", "done"):
+            log.warning("play_index_step_not_ready", extra={"index": index, "status": step_status})
+            # publica status pra UI não ficar perdida
+            await self._publish_status(
+                isPlaying=False,
+                activeIndex=index,
+                elapsedMs=0,
+                bpm=getattr(step, "bpm", 120) or 120,
+                palette=getattr(step, "palette", "blue") or "blue",
+                currentTitle=getattr(step, "title", "") or "",
+                currentType=getattr(step, "type", "music") or "music",
+            )
+            return
 
         self._active_index = index
         self._started_at = time.monotonic()
+        self._last_ct_hue = None  # força enviar CT de novo no primeiro tick
 
         await self._send_ct(off=True)
         await self._send_vu(0, 0)
@@ -113,22 +107,36 @@ class PlaylistExecutor:
             isPlaying=True,
             activeIndex=index,
             elapsedMs=0,
-            bpm=step.bpm,
-            palette=step.palette,
-            currentTitle=step.title,
-            currentType=step.type,
+            bpm=getattr(step, "bpm", 120) or 120,
+            palette=getattr(step, "palette", "blue") or "blue",
+            currentTitle=getattr(step, "title", "") or "",
+            currentType=getattr(step, "type", "music") or "music",
         )
 
-        log.info("step_started", extra={"stepId": step.id})
+        log.info(
+            "step_start",
+            extra={
+                "stepId": getattr(step, "id", None),
+                "index": index,
+                "leftIp": self.ESP_LEFT,
+                "rightIp": self.ESP_RIGHT,
+            },
+        )
 
     async def stop_playback(self):
         await self._send_vu(0, 0)
         await self._send_ct(off=True)
+
+        prev = self._active_index
         self._active_index = None
+        self.is_paused = False
+
         await self._publish_status(isPlaying=False, elapsedMs=0)
+        log.info("step_stop", extra={"activeIndex": prev})
 
     async def _loop(self):
         interval = 1 / self.TICK_HZ
+        log.info("executor_loop_up", extra={"tickHz": self.TICK_HZ})
 
         while self._running:
             try:
@@ -137,33 +145,46 @@ class PlaylistExecutor:
                     continue
 
                 await self._tick()
+                await asyncio.sleep(interval)  # ✅ CRÍTICO: sem isso vira busy-loop
+            except asyncio.CancelledError:
+                break
             except Exception:
                 log.exception("executor_tick_error")
+                await asyncio.sleep(interval)
 
-        await asyncio.sleep(interval)
+        log.info("executor_loop_down")
 
     async def _tick(self) -> None:
-        try:
-            status = await self.state.get_json(PLAYER_STATUS_KEY)
-        except Exception:
-            return
-
+        # lê status do redis (frontend + backend podem atualizar)
+        status = await self.state.get_json(PLAYER_STATUS_KEY)
         if not status or not status.get("isPlaying"):
             return
 
         idx = self._active_index
         if idx is None:
+            # Esse log aqui é o "detector" do bug clássico:
+            # isPlaying true no redis mas play_index não foi chamado
+            now = time.monotonic()
+            if now - self._last_tick_log > 2.0:
+                self._last_tick_log = now
+                log.warning("tick_isPlaying_true_but_no_active_index")
             return
 
         steps = await self._get_steps()
+        if idx < 0 or idx >= len(steps):
+            log.warning("tick_active_index_out_of_range", extra={"idx": idx, "len": len(steps)})
+            await self.stop_playback()
+            return
+
         step = steps[idx]
 
         elapsed = int((time.monotonic() - self._started_at) * 1000)
 
-        await self._publish_status(elapsedMs=elapsed)
+        # publica elapsed pra UI “seguir mais em tempo real”
+        await self._publish_status(elapsedMs=elapsed, activeIndex=idx)
 
-        # ===== VU =====
-        bpm = step.bpm or 120
+        # ===== VU (simples por fase) =====
+        bpm = getattr(step, "bpm", 120) or 120
         beat_ms = 60000 / bpm
         phase = (elapsed % beat_ms) / beat_ms
 
@@ -173,25 +194,49 @@ class PlaylistExecutor:
         await self._send_vu(vu_left, vu_right)
 
         # ===== CONTORNO =====
-        hue = self._palette_to_hue(step.palette)
+        palette = getattr(step, "palette", "blue") or "blue"
+        hue = self._palette_to_hue(palette)
         if hue != self._last_ct_hue:
             await self._send_ct(hue=hue)
             self._last_ct_hue = hue
 
-        if step.durationMs and elapsed >= step.durationMs:
+        # ===== FIM =====
+        duration_ms = getattr(step, "durationMs", None)
+        if duration_ms and elapsed >= int(duration_ms):
             await self.stop_playback()
 
+        # log leve a cada ~2s
+        now = time.monotonic()
+        if now - self._last_tick_log > 2.0:
+            self._last_tick_log = now
+            log.info(
+                "tick_ok",
+                extra={
+                    "idx": idx,
+                    "elapsedMs": elapsed,
+                    "vuLeft": vu_left,
+                    "vuRight": vu_right,
+                    "hue": hue,
+                },
+            )
+
     async def _send_vu(self, left: int, right: int):
-        await self.udp.send(self.ESP_LEFT, f"VU:{left}")
-        await self.udp.send(self.ESP_RIGHT, f"VU:{right}")
+        try:
+            await self.udp.send(self.ESP_LEFT, f"VU:{left}")
+            await self.udp.send(self.ESP_RIGHT, f"VU:{right}")
+        except Exception:
+            log.exception("udp_send_vu_failed", extra={"left": left, "right": right})
 
     async def _send_ct(self, *, hue: int | None = None, off: bool = False):
-        if off:
-            await self.udp.send(self.ESP_LEFT, "CT:OFF")
-            await self.udp.send(self.ESP_RIGHT, "CT:OFF")
-        elif hue is not None:
-            await self.udp.send(self.ESP_LEFT, f"CT:SOLID:{hue}")
-            await self.udp.send(self.ESP_RIGHT, f"CT:SOLID:{hue}")
+        try:
+            if off:
+                await self.udp.send(self.ESP_LEFT, "CT:OFF")
+                await self.udp.send(self.ESP_RIGHT, "CT:OFF")
+            elif hue is not None:
+                await self.udp.send(self.ESP_LEFT, f"CT:SOLID:{hue}")
+                await self.udp.send(self.ESP_RIGHT, f"CT:SOLID:{hue}")
+        except Exception:
+            log.exception("udp_send_ct_failed", extra={"hue": hue, "off": off})
 
     def _palette_to_hue(self, palette: str) -> int:
         return {
@@ -209,6 +254,4 @@ class PlaylistExecutor:
         status = await self.state.get_json(PLAYER_STATUS_KEY) or {}
         status.update(fields)
         await self.state.set_json(PLAYER_STATUS_KEY, status)
-        await self.state.publish_event(
-            EVENTS_CHANNEL, {"type": "status", "data": status}
-        )
+        await self.state.publish_event(EVENTS_CHANNEL, {"type": "status", "data": status})
