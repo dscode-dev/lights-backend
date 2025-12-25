@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import Optional
+from typing import Optional, List
 
 from app.state.playlist_state import get_playlist_raw
 
@@ -18,17 +18,31 @@ def clamp_int(n: int, lo: int, hi: int) -> int:
     return n
 
 
+def clamp01(x: float) -> float:
+    if x < 0.0:
+        return 0.0
+    if x > 1.0:
+        return 1.0
+    return x
+
+
 class PlayerExecutor:
     """
-    Player maestro:
-    - Frontend: status via WS (JSON)
-    - ESPs: comandos via WS TEXT
-    - LEDs seguem envelope REAL do áudio
+    Player maestro (produção):
+    - Status pro frontend via WS JSON (ws_manager)
+    - LEDs pros ESP via WS TEXT (esp_hub)
+    - Energia REAL vem do envelope calculado no pipeline (energyEnvelope)
     """
 
     LED_TICK_S = 1.0 / 60.0  # 60fps
-    VU_HEADROOM = 2          # nunca acender todos os LEDs
-    CONTOUR_PULSE_MS = 120   # duração do impacto do beat
+    CT_PULSE_MS = 90         # duração do "flash" no contorno ao detectar pico
+
+    # ✅ headroom: nunca deixar VU chegar no topo total
+    VU_HEADROOM = 2
+
+    # ✅ contorno "micro pulse" (sensível p/ músicas baixas)
+    CT_MICRO_PULSE_MS = 55
+    CT_MICRO_COOLDOWN_MS = 130
 
     def __init__(self, state, ws, esp_hub):
         self.state = state
@@ -41,21 +55,31 @@ class PlayerExecutor:
         self._play_task: Optional[asyncio.Task] = None
         self._start_monotonic: Optional[float] = None
 
-        # Envelope vindo do frontend
-        self._last_energy: float = 0.0
-        self._last_elapsed_ms: int = 0
+        # Envelope
+        self._env: List[float] = []
+        self._env_frame_ms: int = 20
 
         # Flood control
         self._last_vu_level: Optional[int] = None
         self._last_ct_cmd: Optional[str] = None
 
-        # Hardware
+        # hardware
         self._vu_max = 50
-        self._vu_visual_max = self._vu_max - self.VU_HEADROOM
+        self._vu_visual_max = max(0, self._vu_max - self.VU_HEADROOM)
 
-        # Contorno
-        self._last_pulse_at: int = 0
-        self._flow_phase: float = 0.0
+        # Pico/beat detector (dinâmico)
+        self._floor = 0.05
+        self._ema = 0.10
+        self._last_peak_ms = -999999
+        self._ct_off_at_ms = -1
+
+        # micro pulse state
+        self._last_micro_ms = -999999
+        self._ct_micro_off_at_ms = -1
+
+        # cor base do contorno (azul/roxo)
+        self._ct_hues = [160, 180, 200]  # blue -> lilac -> purple
+        self._ct_hue_idx = 0
 
     # =====================================================
     # PLAYER API
@@ -66,6 +90,25 @@ class PlayerExecutor:
         self.is_playing = True
         self._start_monotonic = time.monotonic()
 
+        step = await self._get_current_step()
+
+        # ✅ carrega envelope (se existir)
+        self._env = list(step.get("energyEnvelope") or [])
+        self._env_frame_ms = int(step.get("energyFrameMs") or 20)
+        if self._env_frame_ms <= 0:
+            self._env_frame_ms = 20
+
+        # reset detector
+        self._floor = 0.05
+        self._ema = 0.10
+        self._last_peak_ms = -999999
+        self._ct_off_at_ms = -1
+        self._last_micro_ms = -999999
+        self._ct_micro_off_at_ms = -1
+
+        # (caso você troque o _vu_max por perfil depois)
+        self._vu_visual_max = max(0, self._vu_max - self.VU_HEADROOM)
+
         await self.ws.broadcast({
             "type": "status",
             "data": {
@@ -75,7 +118,18 @@ class PlayerExecutor:
         })
 
         await self._ensure_led_loop_running()
-        log.info("executor_play", extra={"index": index})
+
+        # contorno inicia OFF (pra não ficar sempre aceso)
+        await self._send_ct("CT:OFF")
+
+        log.info(
+            "executor_play",
+            extra={
+                "index": index,
+                "env_len": len(self._env),
+                "env_frame_ms": self._env_frame_ms,
+            },
+        )
 
     async def pause(self):
         self.is_playing = False
@@ -88,7 +142,7 @@ class PlayerExecutor:
         await self._send_vu(0)
         await self._send_ct("CT:OFF")
 
-        log.info("executor_pause")
+        log.info("executor_pause", extra={"index": self.current_index})
 
     async def next(self):
         steps = await get_playlist_raw(self.state)
@@ -102,30 +156,10 @@ class PlayerExecutor:
         await self.pause()
         await self.play(idx)
 
-    # =====================================================
-    # AUDIO ENVELOPE (VINDO DO FRONTEND)
-    # =====================================================
-
-    async def on_player_audio_frame(
-        self,
-        *,
-        step_index: int,
-        elapsed_ms: int,
-        energy: float,
-        beat: bool = False,
-        **_,
-    ):
-        if step_index != self.current_index:
-            return
-
-        self._last_energy = max(0.0, min(1.0, float(energy)))
-        self._last_elapsed_ms = elapsed_ms
-
-        if beat:
-            self._last_pulse_at = elapsed_ms
+        log.info("executor_next", extra={"index": idx})
 
     # =====================================================
-    # LED LOOP
+    # LOOP LED
     # =====================================================
 
     async def _ensure_led_loop_running(self):
@@ -141,61 +175,129 @@ class PlayerExecutor:
                 if not self.is_playing:
                     continue
 
-                await self._render_vu()
-                await self._render_contour()
+                elapsed_ms = self._elapsed_ms()
+
+                energy = self._energy_at(elapsed_ms)  # 0..1
+                await self._apply_energy(elapsed_ms, energy)
 
         except asyncio.CancelledError:
             return
         except Exception:
             log.exception("led_loop_failed")
 
-    # =====================================================
-    # VU (COM HEADROOM + COMPRESSÃO)
-    # =====================================================
-
-    async def _render_vu(self):
-        """
-        - Sensível em volumes baixos
-        - Compressão suave no topo
-        - Nunca acende todos os LEDs
-        """
-        energy = self._last_energy
-
-        # compressão suave (evita colar no topo)
-        compressed = energy ** 0.85
-
-        level = int(compressed * self._vu_visual_max)
-        level = clamp_int(level, 0, self._vu_visual_max)
-
-        await self._send_vu(level)
+    def _elapsed_ms(self) -> int:
+        if not self._start_monotonic:
+            return 0
+        return int((time.monotonic() - self._start_monotonic) * 1000)
 
     # =====================================================
-    # CONTORNO (FLOW + PULSE)
+    # ENERGY ENGINE
     # =====================================================
 
-    async def _render_contour(self):
-        now = self._last_elapsed_ms
+    def _energy_at(self, elapsed_ms: int) -> float:
+        if not self._env:
+            return 0.0
 
-        # ===== PULSE (beat recente)
-        if now - self._last_pulse_at < self.CONTOUR_PULSE_MS:
-            hue = 200  # roxo / azul forte
+        frame = int(elapsed_ms / self._env_frame_ms)
+        if frame < 0:
+            return 0.0
+        if frame >= len(self._env):
+            # acabou o envelope
+            return 0.0
+
+        return clamp01(float(self._env[frame]))
+
+    async def _apply_energy(self, elapsed_ms: int, energy: float):
+        # 1) VU: usa energia contínua (sensível)
+        # ganho leve p/ músicas baixas, mas sem estourar no topo
+        gain = 1.35
+        e = clamp01(energy * gain)
+
+        # ✅ HEADROOM: nunca chegar em 100% do VU
+        vu = int(e * self._vu_visual_max)
+        vu = clamp_int(vu, 0, self._vu_visual_max)
+        await self._send_vu(vu)
+
+        # 2) Detector dinâmico (EMA + floor)
+        alpha = 0.08
+        self._ema = (1 - alpha) * self._ema + alpha * e
+        self._floor = min(self._floor + 0.002, self._ema * 0.85)
+
+        # threshold de pico (batida forte)
+        thr_peak = max(0.14, self._ema + 0.10)
+        cooldown_peak_ms = 90
+
+        is_peak = (e > thr_peak) and (elapsed_ms - self._last_peak_ms > cooldown_peak_ms)
+
+        if is_peak:
+            self._last_peak_ms = elapsed_ms
+
+            # alterna azul/roxo (sem verde)
+            self._ct_hue_idx = (self._ct_hue_idx + 1) % len(self._ct_hues)
+            hue = self._ct_hues[self._ct_hue_idx]
+
             await self._send_ct(f"CT:SOLID:{hue}")
-            return
+            self._ct_off_at_ms = elapsed_ms + self.CT_PULSE_MS
 
-        # ===== FLOW contínuo
-        speed = 0.5 + (self._last_energy * 3.0)
-        self._flow_phase += speed
+            log.info(
+                "led_peak",
+                extra={
+                    "elapsed_ms": elapsed_ms,
+                    "energy": round(e, 3),
+                    "thr_peak": round(thr_peak, 3),
+                    "vu": vu,
+                    "hue": hue,
+                },
+            )
 
-        hue = int(160 + (self._flow_phase % 40))  # azul → roxo
-        hue = clamp_int(hue, 0, 255)
+        # ✅ micro-pulse: faz o contorno acompanhar sons mais baixos também
+        # (resolve “fica parado muito tempo”)
+        thr_micro = max(0.06, self._ema * 0.70)  # mais sensível que o peak
+        can_micro = (elapsed_ms - self._last_micro_ms) > self.CT_MICRO_COOLDOWN_MS
 
-        await self._send_ct(f"CT:SOLID:{hue}")
+        # só dispara micro se não estiver em pulso forte agora
+        in_peak_window = self._ct_off_at_ms > 0 and elapsed_ms < self._ct_off_at_ms
+
+        if (not in_peak_window) and can_micro and (e > thr_micro):
+            self._last_micro_ms = elapsed_ms
+
+            # alterna azul/roxo também
+            self._ct_hue_idx = (self._ct_hue_idx + 1) % len(self._ct_hues)
+            hue = self._ct_hues[self._ct_hue_idx]
+
+            await self._send_ct(f"CT:SOLID:{hue}")
+            self._ct_micro_off_at_ms = elapsed_ms + self.CT_MICRO_PULSE_MS
+
+        # desliga contorno após pulso forte
+        if self._ct_off_at_ms > 0 and elapsed_ms >= self._ct_off_at_ms:
+            self._ct_off_at_ms = -1
+            await self._send_ct("CT:OFF")
+
+        # desliga contorno após micro-pulso (se não tiver pulso forte ativo)
+        if (not in_peak_window) and self._ct_micro_off_at_ms > 0 and elapsed_ms >= self._ct_micro_off_at_ms:
+            self._ct_micro_off_at_ms = -1
+            await self._send_ct("CT:OFF")
+
+    # =====================================================
+    # HELPERS
+    # =====================================================
+
+    async def _get_current_step(self) -> dict:
+        steps = await get_playlist_raw(self.state)
+        if not steps:
+            return {}
+        if self.current_index < 0 or self.current_index >= len(steps):
+            return {}
+        return steps[self.current_index] or {}
 
     # =====================================================
     # SENDERS
     # =====================================================
 
     async def _send_vu(self, level: int):
+        level = clamp_int(level, 0, self._vu_max)
+
+        # anti-flood: só envia se mudou
         if self._last_vu_level == level:
             return
         self._last_vu_level = level
