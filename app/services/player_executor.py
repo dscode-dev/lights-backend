@@ -1,21 +1,32 @@
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
 from typing import Optional
+
+from app.state.playlist_state import get_playlist_raw
 
 log = logging.getLogger("player.executor")
 
 
 def clamp_int(n: int, lo: int, hi: int) -> int:
-    return max(lo, min(hi, n))
+    if n < lo:
+        return lo
+    if n > hi:
+        return hi
+    return n
 
 
 class PlayerExecutor:
     """
-    Maestro de LEDs
-    - Frontend manda tempo + energia
-    - Backend traduz → ESP
+    Player maestro:
+    - Recebe frames de áudio do frontend
+    - Calcula VU / beats
+    - Envia comandos para ESPs via WS TEXT
     """
+
+    LED_TICK_S = 1.0 / 60.0  # alta resolução
 
     def __init__(self, state, ws, esp_hub):
         self.state = state
@@ -25,30 +36,30 @@ class PlayerExecutor:
         self.is_playing = False
         self.current_index = -1
 
+        self._start_monotonic: Optional[float] = None
+
         # flood control
-        self._last_vu: Optional[int] = None
-        self._last_ct: Optional[str] = None
+        self._last_vu_level: Optional[int] = None
+        self._last_ct_cmd: Optional[str] = None
 
         self._vu_max = 50
 
-    # =====================================================
-    # RESET LED STATE (🔥 FIX CRÍTICO 🔥)
-    # =====================================================
-
-    def _reset_led_state(self):
-        self._last_vu = None
-        self._last_ct = None
+        self._last_debug_log = 0.0
+        self._contour_toggle = False
 
     # =====================================================
-    # PLAYER CONTROL
+    # PLAYER API
     # =====================================================
 
     async def play(self, index: int):
         self.current_index = index
         self.is_playing = True
+        self._start_monotonic = time.monotonic()
 
-        # 🔥 RESETA ESTADO A CADA PLAY
-        self._reset_led_state()
+        log.info(
+            "executor_play",
+            extra={"index": index},
+        )
 
         await self.ws.broadcast({
             "type": "status",
@@ -58,34 +69,38 @@ class PlayerExecutor:
             },
         })
 
-        # estado inicial explícito
-        await self._send_vu(0)
-        await self._send_ct("CT:OFF")
-
     async def pause(self):
         self.is_playing = False
 
+        log.info(
+            "executor_pause",
+            extra={"index": self.current_index},
+        )
+
         await self.ws.broadcast({
             "type": "status",
-            "data": {"isPlaying": False},
+            "data": {
+                "isPlaying": False,
+            },
         })
 
         await self._send_vu(0)
         await self._send_ct("CT:OFF")
 
     async def next(self):
-        steps = await self.state.get_json("playlist:steps") or []
+        steps = await get_playlist_raw(self.state)
         if not steps:
             return
 
-        next_index = self.current_index + 1
-        if next_index >= len(steps):
-            next_index = 0
+        idx = self.current_index + 1
+        if idx >= len(steps):
+            idx = 0
 
-        await self.play(next_index)
+        await self.pause()
+        await self.play(idx)
 
     # =====================================================
-    # AUDIO FRAME (CORE)
+    # AUDIO FRAME (DO FRONTEND)
     # =====================================================
 
     async def on_player_audio_frame(
@@ -94,49 +109,69 @@ class PlayerExecutor:
         step_index: int,
         elapsed_ms: int,
         energy: float,
-        bands: dict | None = None,
-        beat: bool = False,
+        bands: dict,
+        beat: bool,
     ):
         if not self.is_playing:
             return
 
-        if step_index != self.current_index:
-            return
+        vu_level = clamp_int(int(energy * self._vu_max), 0, self._vu_max)
 
-        # ===============================
-        # VU (sensível até som baixo)
-        # ===============================
-        vu_level = int((energy ** 0.6) * self._vu_max)
-        vu_level = clamp_int(vu_level, 0, self._vu_max)
+        self._debug_log(
+            step=self.current_index,
+            elapsed_ms=elapsed_ms,
+            energy=round(energy, 3),
+            vu=vu_level,
+            beat=beat,
+        )
+
         await self._send_vu(vu_level)
 
-        # ===============================
-        # CONTORNO
-        # ===============================
-        if energy > 0.05:
-            # azul → roxo (sem verde)
-            hue = 180 if energy < 0.35 else 200
-            await self._send_ct(f"CT:SOLID:{hue}")
+        if beat:
+            await self._on_beat_contour()
+
+    # =====================================================
+    # CONTOUR
+    # =====================================================
+
+    async def _on_beat_contour(self):
+        self._contour_toggle = not self._contour_toggle
+
+        if self._contour_toggle:
+            cmd = "CT:SOLID:180"  # azul/roxo
         else:
-            await self._send_ct("CT:OFF")
+            cmd = "CT:OFF"
+
+        await self._send_ct(cmd)
 
     # =====================================================
     # SENDERS
     # =====================================================
 
     async def _send_vu(self, level: int):
-        if self._last_vu == level:
+        if self._last_vu_level == level:
             return
-        self._last_vu = level
+        self._last_vu_level = level
 
         cmd = f"VU:{level}"
         self.esp_hub.set_last_vu(cmd)
         await self.esp_hub.broadcast_text(cmd)
 
     async def _send_ct(self, cmd: str):
-        if self._last_ct == cmd:
+        if self._last_ct_cmd == cmd:
             return
-        self._last_ct = cmd
+        self._last_ct_cmd = cmd
 
         self.esp_hub.set_last_ct(cmd)
         await self.esp_hub.broadcast_text(cmd)
+
+    # =====================================================
+    # DEBUG
+    # =====================================================
+
+    def _debug_log(self, **data):
+        now = time.monotonic()
+        if now - self._last_debug_log < 0.5:
+            return
+        self._last_debug_log = now
+        log.info("executor_state", extra=data)
