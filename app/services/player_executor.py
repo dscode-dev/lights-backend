@@ -23,10 +23,11 @@ class PlayerExecutor:
     Player maestro (produção):
     - Status → frontend (WS JSON)
     - LEDs → ESP (WS TEXT)
-    - Envelope REAL do pipeline
+    - Energia REAL vem do envelope do pipeline
     """
 
     LED_TICK_S = 1.0 / 60.0
+    LED_START_DELAY_S = 2.0   # ⏱ delay intencional para alinhar com áudio
 
     def __init__(self, state, ws, esp_hub):
         self.state = state
@@ -38,6 +39,7 @@ class PlayerExecutor:
 
         self._play_task: Optional[asyncio.Task] = None
         self._start_monotonic: Optional[float] = None
+        self._led_start_at: Optional[float] = None
 
         # Envelope
         self._env: List[float] = []
@@ -49,14 +51,10 @@ class PlayerExecutor:
 
         # Hardware
         self._vu_max = 50
-        self._vu_headroom = 2
-        self._vu_visual_max = self._vu_max - self._vu_headroom
+        self._vu_visual_max = 48  # nunca acende tudo
 
-        # VU animation state
-        self._vu_mode = "NORMAL"  # NORMAL | IMPACT
-
-        # Contorno cores
-        self._ct_hues = [160, 180, 200]
+        # Contorno
+        self._ct_hues = [160, 180, 200]  # azul → lilás → roxo
         self._ct_hue_idx = 0
 
     # =====================================================
@@ -66,7 +64,10 @@ class PlayerExecutor:
     async def play(self, index: int):
         self.current_index = index
         self.is_playing = True
-        self._start_monotonic = time.monotonic()
+
+        now = time.monotonic()
+        self._start_monotonic = now
+        self._led_start_at = now + self.LED_START_DELAY_S
 
         step = await self._get_current_step()
 
@@ -75,18 +76,26 @@ class PlayerExecutor:
         if self._env_frame_ms <= 0:
             self._env_frame_ms = 20
 
-        self._vu_mode = "NORMAL"
-        self._ct_hue_idx = 0
-
         await self.ws.broadcast({
             "type": "status",
-            "data": {"isPlaying": True, "activeIndex": index},
+            "data": {
+                "isPlaying": True,
+                "activeIndex": index,
+            },
         })
 
         await self._ensure_led_loop_running()
         await self._send_ct("CT:OFF")
+        await self._send_vu(0)
 
-        log.info("executor_play", extra={"index": index})
+        log.info(
+            "executor_play",
+            extra={
+                "index": index,
+                "led_delay_s": self.LED_START_DELAY_S,
+                "env_len": len(self._env),
+            },
+        )
 
     async def pause(self):
         self.is_playing = False
@@ -121,22 +130,23 @@ class PlayerExecutor:
         try:
             while True:
                 await asyncio.sleep(self.LED_TICK_S)
+
                 if not self.is_playing:
                     continue
 
-                elapsed_ms = self._elapsed_ms()
+                now = time.monotonic()
+                if self._led_start_at and now < self._led_start_at:
+                    continue  # ⏸ aguardando delay inicial
+
+                elapsed_ms = int((now - self._start_monotonic) * 1000)
                 energy = self._energy_at(elapsed_ms)
+
                 await self._apply_energy(energy)
 
         except asyncio.CancelledError:
             return
         except Exception:
             log.exception("led_loop_failed")
-
-    def _elapsed_ms(self) -> int:
-        if not self._start_monotonic:
-            return 0
-        return int((time.monotonic() - self._start_monotonic) * 1000)
 
     # =====================================================
     # ENERGY
@@ -145,14 +155,16 @@ class PlayerExecutor:
     def _energy_at(self, elapsed_ms: int) -> float:
         if not self._env:
             return 0.0
+
         frame = int(elapsed_ms / self._env_frame_ms)
         if frame < 0 or frame >= len(self._env):
             return 0.0
+
         return clamp01(float(self._env[frame]))
 
     async def _apply_energy(self, energy: float):
         # ===== VU =====
-        gain = 1.3
+        gain = 1.25
         e = clamp01(energy * gain)
 
         vu = int(e * self._vu_visual_max)
@@ -160,26 +172,16 @@ class PlayerExecutor:
 
         await self._send_vu(vu)
 
-        # ===== CONTORNO ACOMPANHA VU =====
-        if vu > 0:
-            self._ct_hue_idx = (self._ct_hue_idx + 1) % len(self._ct_hues)
-            hue = self._ct_hues[self._ct_hue_idx]
+        # ===== CONTORNO SEMPRE ACOMPANHA =====
+        if e > 0.05:
+            # intensidade implícita via frequência de updates
+            if e > 0.6:
+                self._ct_hue_idx = (self._ct_hue_idx + 1) % len(self._ct_hues)
 
-            # intensidade implícita via VU (ESP já sabe lidar)
+            hue = self._ct_hues[self._ct_hue_idx]
             await self._send_ct(f"CT:SOLID:{hue}")
         else:
             await self._send_ct("CT:OFF")
-
-        # ===== PICO MUITO ALTO → MUDA ANIMAÇÃO DO VU =====
-        peak_threshold = int(self._vu_visual_max * 0.85)
-
-        if vu >= peak_threshold and self._vu_mode != "IMPACT":
-            self._vu_mode = "IMPACT"
-            await self._send_vu_mode("IMPACT")
-
-        elif vu < peak_threshold * 0.6 and self._vu_mode != "NORMAL":
-            self._vu_mode = "NORMAL"
-            await self._send_vu_mode("NORMAL")
 
     # =====================================================
     # HELPERS
@@ -204,10 +206,6 @@ class PlayerExecutor:
 
         cmd = f"VU:{level}"
         self.esp_hub.set_last_vu(cmd)
-        await self.esp_hub.broadcast_text(cmd)
-
-    async def _send_vu_mode(self, mode: str):
-        cmd = f"VU_MODE:{mode}"
         await self.esp_hub.broadcast_text(cmd)
 
     async def _send_ct(self, cmd: str):
