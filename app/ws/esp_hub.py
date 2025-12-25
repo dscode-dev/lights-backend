@@ -12,16 +12,24 @@ log = logging.getLogger("esp.ws")
 class EspWebSocketHub:
     """
     Hub exclusivo para ESPs.
-    - Envia comandos TEXT
-    - Stateless (reenvia estado ao reconectar)
+    - Só envia TEXT frames (strings)
+    - Não usa JSON
+    - Não exige ACK
     """
 
     def __init__(self) -> None:
         self._clients: Set[WebSocket] = set()
         self._lock = asyncio.Lock()
 
-        self._last_ct: Optional[str] = None
-        self._last_vu: Optional[str] = None
+        self._last_ct: Optional[str] = None   # ex: "CT:OFF" or "CT:SOLID:160"
+        self._last_vu: Optional[str] = None   # ex: "VU:10"
+
+        # debug
+        self._tx_count = 0
+        self._tx_drop_no_clients = 0
+
+    def clients_count(self) -> int:
+        return len(self._clients)
 
     async def connect(self, ws: WebSocket) -> None:
         await ws.accept()
@@ -59,21 +67,28 @@ class EspWebSocketHub:
             clients = list(self._clients)
 
         if not clients:
-            log.warning(
-                "esp_broadcast_no_clients",
-                extra={"cmd": cmd},
-            )
+            self._tx_drop_no_clients += 1
+            if self._tx_drop_no_clients % 10 == 0:
+                log.warning(
+                    "esp_tx_drop_no_clients",
+                    extra={"drops": self._tx_drop_no_clients, "last_cmd": cmd},
+                )
             return
 
-        log.info(
-            "esp_broadcast",
-            extra={
-                "cmd": cmd,
-                "clients": len(clients),
-            },
-        )
+        dead: list[WebSocket] = []
+        self._tx_count += 1
 
-        dead = []
+        # log leve (a cada 30 sends)
+        if self._tx_count % 30 == 0:
+            log.info(
+                "esp_tx",
+                extra={
+                    "clients": len(clients),
+                    "cmd": cmd,
+                    "tx_count": self._tx_count,
+                },
+            )
+
         for ws in clients:
             try:
                 await ws.send_text(cmd)
@@ -84,3 +99,4 @@ class EspWebSocketHub:
             async with self._lock:
                 for ws in dead:
                     self._clients.discard(ws)
+            log.warning("esp_clients_pruned", extra={"removed": len(dead), "clients": len(self._clients)})
