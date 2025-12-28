@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import Optional, List
+from typing import Optional, List, Dict
 
 from app.state.playlist_state import get_playlist_raw
 
@@ -23,11 +23,12 @@ class PlayerExecutor:
     Player maestro (produção):
     - Status → frontend (WS JSON)
     - LEDs → ESP (WS TEXT)
-    - Energia REAL vem do envelope do pipeline
+    - Envelope RMS → VU
+    - FX map → coreografia manual
     """
 
     LED_TICK_S = 1.0 / 60.0
-    LED_START_DELAY_S = 2.0   # ⏱ delay intencional para alinhar com áudio
+    LED_START_DELAY_S = 2.0
 
     def __init__(self, state, ws, esp_hub):
         self.state = state
@@ -48,14 +49,18 @@ class PlayerExecutor:
         # Flood control
         self._last_vu_level: Optional[int] = None
         self._last_ct_cmd: Optional[str] = None
+        self._last_fx: Dict[str, str] = {}
 
         # Hardware
         self._vu_max = 50
-        self._vu_visual_max = 48  # nunca acende tudo
+        self._vu_visual_max = 48
 
         # Contorno
-        self._ct_hues = [160, 180, 200]  # azul → lilás → roxo
+        self._ct_hues = [160, 180, 200]
         self._ct_hue_idx = 0
+
+        # Effects
+        self._effects: Dict[str, Dict[str, str]] = {}
 
     # =====================================================
     # PLAYER API
@@ -73,8 +78,8 @@ class PlayerExecutor:
 
         self._env = list(step.get("energyEnvelope") or [])
         self._env_frame_ms = int(step.get("energyFrameMs") or 20)
-        if self._env_frame_ms <= 0:
-            self._env_frame_ms = 20
+        self._effects = step.get("effects") or {}
+        self._last_fx.clear()
 
         await self.ws.broadcast({
             "type": "status",
@@ -92,8 +97,7 @@ class PlayerExecutor:
             "executor_play",
             extra={
                 "index": index,
-                "led_delay_s": self.LED_START_DELAY_S,
-                "env_len": len(self._env),
+                "effects": self._effects,
             },
         )
 
@@ -136,7 +140,7 @@ class PlayerExecutor:
 
                 now = time.monotonic()
                 if self._led_start_at and now < self._led_start_at:
-                    continue  # ⏸ aguardando delay inicial
+                    continue
 
                 elapsed_ms = int((now - self._start_monotonic) * 1000)
                 energy = self._energy_at(elapsed_ms)
@@ -164,24 +168,42 @@ class PlayerExecutor:
 
     async def _apply_energy(self, energy: float):
         # ===== VU =====
-        gain = 1.25
-        e = clamp01(energy * gain)
-
-        vu = int(e * self._vu_visual_max)
-        vu = clamp_int(vu, 0, self._vu_visual_max)
-
+        e = clamp01(energy * 1.25)
+        vu = clamp_int(int(e * self._vu_visual_max), 0, self._vu_visual_max)
         await self._send_vu(vu)
 
-        # ===== CONTORNO SEMPRE ACOMPANHA =====
+        # ===== CONTORNO =====
         if e > 0.05:
-            # intensidade implícita via frequência de updates
             if e > 0.6:
                 self._ct_hue_idx = (self._ct_hue_idx + 1) % len(self._ct_hues)
-
             hue = self._ct_hues[self._ct_hue_idx]
             await self._send_ct(f"CT:SOLID:{hue}")
         else:
             await self._send_ct("CT:OFF")
+
+        # ===== FX MAP =====
+        if not self._effects:
+            return
+
+        bucket = "high" if e > 0.55 else "default"
+        fx = self._effects.get(bucket) or {}
+
+        for group, mode in fx.items():
+            if self._last_fx.get(group) == mode:
+                continue
+
+            self._last_fx[group] = mode
+            cmd = f"FX:{group.upper()}:{mode.upper()}"
+            await self.esp_hub.broadcast_text(cmd)
+
+            log.info(
+                "fx_change",
+                extra={
+                    "group": group,
+                    "mode": mode,
+                    "energy": round(e, 3),
+                },
+            )
 
     # =====================================================
     # HELPERS
