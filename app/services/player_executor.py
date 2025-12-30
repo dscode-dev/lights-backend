@@ -53,6 +53,13 @@ class PlayerExecutor:
         # FX
         self._effects: Dict[str, Dict[str, str]] = {}
 
+        # ===== MOCK DRAW STATE =====
+        self._draw_on = False
+        self._draw_next_eye = 0.0
+        self._draw_next_talk = 0.0
+        self._draw_eye_state = False
+        self._draw_talk_state = False
+
     # =====================================================
     # PLAYER API
     # =====================================================
@@ -72,6 +79,13 @@ class PlayerExecutor:
         self._env_frame_ms = int(step.get("energyFrameMs") or 20)
         self._effects = step.get("effects") or {}
 
+        # ===== MOCK DRAW INIT =====
+        self._draw_on = True
+        self._draw_eye_state = False
+        self._draw_talk_state = False
+        self._draw_next_eye = now
+        self._draw_next_talk = now
+
         await self.ws.broadcast({
             "type": "status",
             "data": {
@@ -84,13 +98,20 @@ class PlayerExecutor:
         await self._send_ct("CT:OFF")
         await self._send_vu(0)
 
+        # liga desenhos
+        await self.esp_hub.broadcast_text("FX:DRAW:ON")
+
         log.info("executor_play", extra={"index": index})
 
     async def pause(self):
         self.is_playing = False
+
         await self.ws.broadcast({"type": "status", "data": {"isPlaying": False}})
         await self._send_vu(0)
         await self._send_ct("CT:OFF")
+
+        # desliga desenhos
+        await self.esp_hub.broadcast_text("FX:DRAW:OFF")
 
     async def next(self):
         steps = await get_playlist_raw(self.state)
@@ -125,6 +146,7 @@ class PlayerExecutor:
                 energy = self._energy_at(elapsed_ms)
 
                 await self._apply_energy(energy)
+                await self._mock_draw(now, energy)
 
         except asyncio.CancelledError:
             return
@@ -146,12 +168,10 @@ class PlayerExecutor:
         return clamp01(float(self._env[frame]))
 
     async def _apply_energy(self, energy: float):
-        # ===== VU =====
         e = clamp01(energy * 1.25)
         vu = clamp_int(int(e * self._vu_visual_max), 0, self._vu_visual_max)
         await self._send_vu(vu)
 
-        # ===== CONTORNO (COR BASE) =====
         if e > 0.05:
             if e > 0.6:
                 self._ct_hue_idx = (self._ct_hue_idx + 1) % len(self._ct_hues)
@@ -161,17 +181,36 @@ class PlayerExecutor:
             await self._send_ct("CT:OFF")
             return
 
-        # ===== CONTORNO (TRIGGER REAL) =====
         now = time.monotonic()
-
-        # pico forte → sempre trigga
         if e > 0.55:
             await self._send_fx_trig()
             return
 
-        # energia média → trigga com rate limit (~6Hz)
         if e > 0.18 and (now - self._last_fx_trig_at) > 0.16:
             await self._send_fx_trig()
+
+    # =====================================================
+    # MOCK DRAW (NOVO)
+    # =====================================================
+
+    async def _mock_draw(self, now: float, energy: float):
+        if not self._draw_on:
+            return
+
+        # olhos piscam aleatoriamente
+        if now >= self._draw_next_eye:
+            self._draw_eye_state = not self._draw_eye_state
+            cmd = "FX:DRAW:EYES:ON" if self._draw_eye_state else "FX:DRAW:EYES:OFF"
+            await self.esp_hub.broadcast_text(cmd)
+            self._draw_next_eye = now + 0.8
+
+        # boca acompanha energia
+        talking = energy > 0.12
+        if talking != self._draw_talk_state and now >= self._draw_next_talk:
+            self._draw_talk_state = talking
+            cmd = "FX:DRAW:TALK:ON" if talking else "FX:DRAW:TALK:OFF"
+            await self.esp_hub.broadcast_text(cmd)
+            self._draw_next_talk = now + 0.12
 
     # =====================================================
     # HELPERS
@@ -197,7 +236,6 @@ class PlayerExecutor:
         if self._last_vu_level == level:
             return
         self._last_vu_level = level
-
         cmd = f"VU:{level}"
         self.esp_hub.set_last_vu(cmd)
         await self.esp_hub.broadcast_text(cmd)
@@ -206,6 +244,5 @@ class PlayerExecutor:
         if self._last_ct_cmd == cmd:
             return
         self._last_ct_cmd = cmd
-
         self.esp_hub.set_last_ct(cmd)
         await self.esp_hub.broadcast_text(cmd)
